@@ -113,6 +113,13 @@ App :: struct {
 	shift:        f32,
 	shift_by:     int,
 
+	// The cover growing out of the grid into the feature slot. `grow` runs
+	// 1 -> 0 across it.
+	grow:         f32,
+	grow_from:    Rect,
+	grow_slot:    u32,
+	grow_has_art: bool,
+
 	// The big cover turns over when the track changes: `flip` runs 1 -> 0 and
 	// `flip_dir` decides which way, while `prev_art` is what it turns away
 	// from.
@@ -490,7 +497,12 @@ draw_queue :: proc(
 	// The layout as it stood before this frame's change: the cover that is
 	// about to become the feature was sitting somewhere in it, and that is
 	// where its flight starts.
-	track_change_pulse(app, now_uri)
+	// The layout as it stood before this change, which is where the incoming
+	// cover was sitting.
+	previous_start := app.now_index >= 0 ? app.now_index + 1 : 0
+	previous_grid := grid_for(r.w, app.now_index >= 0 ? count - 1 : count)
+	_ = previous_start
+	track_change_pulse(app, now_uri, previous_grid, r, count)
 
 	// The grid is the queue from the next track onward, wrapping round, so the
 	// tile beside the feature really is what plays next.
@@ -563,6 +575,37 @@ draw_queue :: proc(
 		draw_tile(app, cell, track, indices[vi], fade)
 	}
 
+	// Drawn last, over the tiles, on its way to the corner.
+	if app.grow > 0.001 && app.grow_has_art {
+		t := clamp(1 - app.grow, 0, 1)
+
+		// Ease out with a touch of overshoot, so it settles into the corner
+		// instead of coasting to a stop.
+		back :: 0.9
+		u := t - 1
+		e := 1 + (back + 1) * u * u * u + back * u * u
+
+		from := app.grow_from
+		box := Rect {
+			from.x + (feature.x - from.x) * e,
+			from.y + (feature.y - from.y) * e,
+			from.w + (feature.w - from.w) * e,
+			from.h + (feature.h - from.h) * e,
+		}
+		radius := (from.w * 0.055) + (feature.w * 0.035 - from.w * 0.055) * e
+
+		// Dissolve into the feature over the last of the travel, so there is
+		// no visible swap at the end.
+		alpha := u8(255 * clamp((1 - t) / 0.25, 0, 1))
+		ui_glow(
+			ui,
+			{box.x + box.w / 2, box.y + box.h / 2},
+			box.w * 0.75,
+			color_alpha(ACCENT, 0.45 * app.grow),
+		)
+		ui_image(ui, box, app.grow_slot, radius, rgba(255, 255, 255, alpha))
+	}
+
 	ui_end_scroll(ui, r, &app.scroll)
 }
 
@@ -619,17 +662,15 @@ draw_feature :: proc(app: ^App, r: Rect, name, artist: string, progress, duratio
 	}
 
 	ui_rect(ui, cover, PANEL_HI, radius)
-	settle := swell * 0.020
-
 	// Use the full-size slot only while it actually holds this track. It takes
 	// a moment to download, and showing the previous cover until it lands made
 	// clicking feel like nothing had happened.
 	big_ready := app.feature_ready && app.feature_shown == app.feature_url
 	if big_ready {
-		ui_image_wobble(ui, cover, app.feature_slot, settle, radius)
+		ui_image(ui, cover, app.feature_slot, radius)
 	} else if small, has := current_art_slot(app); has {
 		// The grid already has this cover at tile size; show it at once.
-		ui_image_wobble(ui, cover, small, settle, radius)
+		ui_image(ui, cover, small, radius)
 	}
 	if swell > 0.01 {
 		ui_rect(ui, cover, rgba(255, 255, 255, u8(55 * swell)), radius)
@@ -666,7 +707,7 @@ draw_feature :: proc(app: ^App, r: Rect, name, artist: string, progress, duratio
 }
 
 @(private = "file")
-track_change_pulse :: proc(app: ^App, now_uri: string) {
+track_change_pulse :: proc(app: ^App, now_uri: string, layout: Grid, area: Rect, count: int) {
 	ui := &app.ui
 	if now_uri != app.last_now_uri {
 		delete(app.last_now_uri)
@@ -704,7 +745,19 @@ track_change_pulse :: proc(app: ^App, now_uri: string) {
 				app.shift = 1
 			}
 		}
-		_ = small
+
+		// The new track was a tile in the grid a moment ago. Grow it out of
+		// exactly that cell, so the cover you clicked is the one that arrives.
+		app.grow = 0
+		if previous_index >= 0 && app.now_index >= 0 && count > 0 && layout.cell > 0 {
+			slot := app.now_index - previous_index - 1
+			if slot < 0 do slot += count
+			if slot >= 0 && slot < count {
+				app.grow_from = grid_slot_rect(layout, area, app.scroll.offset, slot)
+				app.grow_slot, app.grow_has_art = app.art[small]
+				if app.grow_has_art do app.grow = 1
+			}
+		}
 	}
 	if app.pulse > 0 {
 		app.pulse = max(app.pulse - ui.dt * 2.2, 0)
@@ -712,6 +765,10 @@ track_change_pulse :: proc(app: ^App, now_uri: string) {
 	}
 	if app.shift > 0 {
 		app.shift = max(app.shift - ui.dt * 4.5, 0)
+		ui.animating = true
+	}
+	if app.grow > 0 {
+		app.grow = max(app.grow - ui.dt * 3.4, 0)
 		ui.animating = true
 	}
 }

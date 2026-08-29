@@ -43,8 +43,7 @@ Effect :: enum u32 {
 	None  = 0,
 	Glow  = 1, // soft radial falloff
 	Sheen = 2, // travelling highlight
-	Ring   = 3, // fading annulus
-	Wobble = 4, // artwork rippling like it is under water
+	Ring  = 3, // fading annulus
 }
 
 Vertex :: struct {
@@ -316,24 +315,6 @@ ui_circle :: proc(ui: ^UI, centre: [2]f32, radius: f32, col: Color) {
 
 ui_image :: proc(ui: ^UI, r: Rect, tex: u32, radius: f32 = NO_ROUND, tint: Color = 0xffffffff) {
 	ui_quad(ui, r, {0, 0}, {1, 1}, tint, tex, radius)
-}
-
-// Artwork with a ripple running through it. `amount` is roughly how far the
-// surface bends, in texture coordinates; fade it to zero to settle.
-ui_image_wobble :: proc(
-	ui: ^UI,
-	r: Rect,
-	tex: u32,
-	amount: f32,
-	radius: f32 = NO_ROUND,
-	tint: Color = 0xffffffff,
-) {
-	if amount <= 0.0005 {
-		ui_image(ui, r, tex, radius, tint)
-		return
-	}
-	ui.time_effects = true
-	ui_quad(ui, r, {0, 0}, {1, 1}, tint, tex, radius, .Wobble, amount)
 }
 
 ui_text :: proc(
