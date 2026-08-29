@@ -123,8 +123,9 @@ audio_writer :: proc(out: ^Audio_Out) {
 	}
 }
 
-// Takes ownership of `samples` and starts playing from the beginning.
-audio_out_set_track :: proc(out: ^Audio_Out, samples: []i16) {
+// Takes ownership of `samples`, starts from the beginning, and hands back the
+// buffer that was playing so the caller can keep it around.
+audio_out_swap_track :: proc(out: ^Audio_Out, samples: []i16) -> (previous: []i16) {
 	sync.lock(&out.mutex)
 	old := out.samples
 	out.samples = samples
@@ -134,7 +135,11 @@ audio_out_set_track :: proc(out: ^Audio_Out, samples: []i16) {
 	out.flush = true // no tail of the previous track over the new one
 	sync.unlock(&out.mutex)
 
-	delete(old)
+	return old
+}
+
+audio_out_set_track :: proc(out: ^Audio_Out, samples: []i16) {
+	delete(audio_out_swap_track(out, samples))
 }
 
 audio_out_set_playing :: proc(out: ^Audio_Out, playing: bool) {

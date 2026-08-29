@@ -158,7 +158,7 @@ run_ui :: proc(client: Client, device: string) {
 			left := FRAME_BUDGET - time.since(last_draw)
 			timeout = left > 0 ? i32(time.duration_milliseconds(left)) : 0
 		} else if last_state.playing {
-			timeout = 200
+			timeout = 40 // keep the scrub line moving smoothly
 		}
 		window_poll(&app.win, timeout)
 
@@ -274,8 +274,14 @@ frame_state :: proc(app: ^App) -> (fs: Frame_State) {
 	fs.now_uri = ui_id(s.now_uri)
 	fs.status = ui_id(s.status)
 	fs.playing = s.is_playing
+	if app.player.ready {
+		pos := player_position(&app.player)
+		fs.half_second = pos.position_ms / 50
+		fs.playing = pos.playing
+		fs.duration = pos.duration_ms
+	}
 	fs.loaded = s.loaded
-	fs.half_second = s.progress_ms / 500
+	fs.half_second = s.progress_ms / 50 // 20 updates a second keeps the bar smooth
 	fs.duration = s.duration_ms
 	fs.count = len(s.tracks)
 	fs.volume = s.volume
@@ -341,9 +347,16 @@ draw_app :: proc(app: ^App) {
 	since := time.duration_milliseconds(time.since(s.last_poll))
 	sync.unlock(&s.mutex)
 
-	// The player only tells us where it is once a second; run the bar forward
-	// in between so it doesn't visibly tick.
-	if is_playing do progress = min(progress + int(since), duration)
+	// Straight from the audio device: the worker's copy is only as fresh as
+	// its tick, which made the bar visibly step.
+	if app.player.ready {
+		pos := player_position(&app.player)
+		if pos.duration_ms > 0 {
+			progress, duration = pos.position_ms, pos.duration_ms
+			is_playing = pos.playing
+		}
+	}
+	_ = since
 
 	list := Rect{0, 0, w, h - BAR_H}
 	if loaded && count > 0 {
@@ -474,16 +487,6 @@ draw_queue :: proc(app: ^App, r: Rect, now_uri: string, progress, duration: int)
 			)
 		}
 
-		// ... and a ring thrown outward at the moment it starts.
-		if pulse > 0.02 {
-			ui_ring(
-				ui,
-				{cover.x + cover.w / 2, cover.y + cover.h / 2},
-				g.tile * (0.55 + (1 - pulse) * 0.7),
-				color_alpha(ACCENT, pulse * 0.8),
-			)
-		}
-
 		slot, has_art := app.art[track.art_url]
 		if !has_art do want_art(app, track.art_url)
 
@@ -559,11 +562,6 @@ draw_now_playing :: proc(
 
 	cy := r.y + (r.h + line_h) / 2
 
-	// Times sit at the edges, quiet.
-	ui_text(ui, &ui.regular, ms_to_time(progress), {r.x + 22, cy - 8}, 13, MUTED)
-	total := ms_to_time(duration)
-	ui_text(ui, &ui.regular, total, {r.w - 22 - font_width(&ui.regular, total, 13), cy - 8}, 13, MUTED)
-
 	// Transport, centred.
 	cx := r.w / 2
 	if transport_button(ui, "prev", Rect{cx - 104, cy - 23, 46, 46}, .Previous_Icon, false) {
@@ -581,8 +579,7 @@ draw_now_playing :: proc(
 	volume := app.shared.volume
 	sync.unlock(&app.shared.mutex)
 
-	vol := Rect{r.w - 300, cy - 14, 210, 28}
-	draw_speaker(ui, {vol.x - 30, cy}, volume, MUTED)
+	vol := Rect{r.w - 360, cy - 18, 330, 36}
 	new_volume := volume_slider(ui, vol, volume)
 	if new_volume != volume {
 		player_set_volume(&app.player, new_volume)
@@ -607,7 +604,7 @@ volume_slider :: proc(ui: ^UI, r: Rect, value: f32) -> f32 {
 	value := clamp(value, 0, 1)
 	if held && r.w > 0 do value = clamp((ui.mouse.x - r.x) / r.w, 0, 1)
 
-	h := 6 + feel * 4
+	h := 9 + feel * 5
 	bar := Rect{r.x, r.y + r.h / 2 - h / 2, r.w, h}
 	ui_rect(ui, bar, rgba(255, 255, 255, 24), h / 2)
 
@@ -618,7 +615,7 @@ volume_slider :: proc(ui: ^UI, r: Rect, value: f32) -> f32 {
 		ui_glow(ui, {fill.x + fill.w, bar.y + h / 2}, 16 + feel * 12, color_alpha(ACCENT, 0.45))
 	}
 
-	knob := 7 + feel * 4
+	knob := 10 + feel * 5
 	ui_circle(ui, {bar.x + bar.w * value, bar.y + h / 2}, knob, TEXT)
 	return value
 }
@@ -639,16 +636,10 @@ transport_button :: proc(ui: ^UI, label: string, r: Rect, icon: Icon, primary: b
 
 	press := ui_anim(ui, id ~ 2, ui.active == id ? 1 : 0, 30)
 	hover := ui_anim(ui, id, hovered ? 1 : 0, 18)
-	// Rises to 1 the moment it is clicked, then falls back on its own.
-	ripple := ui_anim(ui, id ~ 5, clicked ? 1 : 0, clicked ? 60 : 3)
 	scale := 1 + hover * 0.10 - press * 0.14
 
 	c := [2]f32{r.x + r.w / 2, r.y + r.h / 2}
 	radius := r.w / 2 * scale
-
-	if ripple > 0.02 {
-		ui_ring(ui, c, radius * (1 + (1 - ripple) * 1.5), color_alpha(ACCENT, ripple * 0.7))
-	}
 
 	if primary {
 		ui_glow(ui, c, radius * (2.1 + hover * 0.5), color_alpha(ACCENT, 0.30 + hover * 0.35))
@@ -695,19 +686,6 @@ draw_icon :: proc(ui: ^UI, c: [2]f32, size: f32, icon: Icon, col: Color) {
 		ui_tri(ui, {right, c.y - size}, {right - w, c.y}, {right, c.y + size}, col)
 		ui_rect(ui, {right - w - bar * 1.2, c.y - size, bar, size * 2}, col, bar / 3)
 	}
-}
-
-// A speaker whose waves come and go with the level.
-@(private = "file")
-draw_speaker :: proc(ui: ^UI, c: [2]f32, volume: f32, col: Color) {
-	ui_rect(ui, {c.x - 7, c.y - 3, 4, 6}, col, 1)
-	ui_tri(ui, {c.x - 3, c.y - 7}, {c.x + 2, c.y - 7}, {c.x - 3, c.y}, col)
-	ui_tri(ui, {c.x - 3, c.y}, {c.x + 2, c.y + 7}, {c.x - 3, c.y + 7}, col)
-	ui_rect(ui, {c.x - 1, c.y - 7, 3, 14}, col, 1)
-
-	if volume > 0.05 do ui_rect(ui, {c.x + 4, c.y - 2, 2, 4}, col, 1)
-	if volume > 0.45 do ui_rect(ui, {c.x + 7, c.y - 4, 2, 8}, col, 1)
-	if volume > 0.8 do ui_rect(ui, {c.x + 10, c.y - 6, 2, 12}, col, 1)
 }
 
 @(private = "file")

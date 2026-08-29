@@ -16,6 +16,13 @@ Player :: struct {
 	out:           Audio_Out,
 	ready:         bool,
 	pre:           Preloader,
+
+	// What is playing, and the track before it. Keeping the previous buffer
+	// makes going back instant, which matters because nothing preloads
+	// backwards.
+	current_uri:   string,
+	prev_uri:      string,
+	prev_samples:  []i16,
 }
 
 // Decodes the next track while the current one plays, so skipping forward is a
@@ -116,6 +123,10 @@ preload_worker :: proc(pre: ^Preloader) {
 }
 
 player_destroy :: proc(p: ^Player) {
+	delete(p.current_uri)
+	delete(p.prev_uri)
+	delete(p.prev_samples)
+
 	sync.lock(&p.pre.mutex)
 	p.pre.quit = true
 	sync.unlock(&p.pre.mutex)
@@ -138,23 +149,43 @@ player_destroy :: proc(p: ^Player) {
 player_load :: proc(p: ^Player, uri: string) -> bool {
 	if !p.ready do return false
 
-	// The fast path: already decoded and waiting.
-	sync.lock(&p.pre.mutex)
-	if p.pre.ready_uri == uri && p.pre.samples != nil {
-		samples := p.pre.samples
-		p.pre.samples = nil
-		delete(p.pre.ready_uri)
-		p.pre.ready_uri = ""
-		sync.unlock(&p.pre.mutex)
+	samples: []i16
 
-		audio_out_set_track(&p.out, samples)
-		return true
+	// Going back to the track we just came from.
+	if p.prev_uri == uri && p.prev_samples != nil {
+		samples = p.prev_samples
+		p.prev_samples = nil
+		delete(p.prev_uri)
+		p.prev_uri = ""
 	}
-	sync.unlock(&p.pre.mutex)
 
-	audio, ok := load_track_audio(p.session, p.session_token, uri)
-	if !ok do return false
-	audio_out_set_track(&p.out, audio.samples)
+	// Already decoded by the preloader.
+	if samples == nil {
+		sync.lock(&p.pre.mutex)
+		if p.pre.ready_uri == uri && p.pre.samples != nil {
+			samples = p.pre.samples
+			p.pre.samples = nil
+			delete(p.pre.ready_uri)
+			p.pre.ready_uri = ""
+		}
+		sync.unlock(&p.pre.mutex)
+	}
+
+	// Nothing ready: fetch and decode, which takes a few seconds.
+	if samples == nil {
+		audio, ok := load_track_audio(p.session, p.session_token, uri)
+		if !ok do return false
+		samples = audio.samples
+	}
+
+	outgoing := audio_out_swap_track(&p.out, samples)
+
+	// Whatever was playing becomes the one step back.
+	delete(p.prev_samples)
+	delete(p.prev_uri)
+	p.prev_samples = outgoing
+	p.prev_uri = p.current_uri
+	p.current_uri = strings.clone(uri)
 	return true
 }
 
