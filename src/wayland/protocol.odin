@@ -4,6 +4,7 @@
 //   /usr/share/wayland/wayland.xml
 //   /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
 //   /usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+//   /usr/share/wayland-protocols/staging/ext-background-effect/ext-background-effect-v1.xml
 package wayland
 
 import "core:c"
@@ -38,6 +39,8 @@ xdg_toplevel :: struct {}
 xdg_popup :: struct {}
 zxdg_decoration_manager_v1 :: struct {}
 zxdg_toplevel_decoration_v1 :: struct {}
+ext_background_effect_manager_v1 :: struct {}
+ext_background_effect_surface_v1 :: struct {}
 
 wl_display_interface: Interface
 wl_registry_interface: Interface
@@ -69,6 +72,8 @@ xdg_toplevel_interface: Interface
 xdg_popup_interface: Interface
 zxdg_decoration_manager_v1_interface: Interface
 zxdg_toplevel_decoration_v1_interface: Interface
+ext_background_effect_manager_v1_interface: Interface
+ext_background_effect_surface_v1_interface: Interface
 
 @(private) wl_display_requests: [2]Message
 @(private) wl_display_requests_types_0 := [1]^Interface{&wl_callback_interface}
@@ -255,6 +260,12 @@ zxdg_toplevel_decoration_v1_interface: Interface
 @(private) zxdg_toplevel_decoration_v1_requests_types_1 := [1]^Interface{nil}
 @(private) zxdg_toplevel_decoration_v1_events: [1]Message
 @(private) zxdg_toplevel_decoration_v1_events_types_0 := [1]^Interface{nil}
+@(private) ext_background_effect_manager_v1_requests: [2]Message
+@(private) ext_background_effect_manager_v1_requests_types_1 := [2]^Interface{&ext_background_effect_surface_v1_interface, &wl_surface_interface}
+@(private) ext_background_effect_manager_v1_events: [1]Message
+@(private) ext_background_effect_manager_v1_events_types_0 := [1]^Interface{nil}
+@(private) ext_background_effect_surface_v1_requests: [2]Message
+@(private) ext_background_effect_surface_v1_requests_types_1 := [1]^Interface{&wl_region_interface}
 
 @(init, private)
 init_interfaces :: proc "contextless" () {
@@ -473,6 +484,13 @@ init_interfaces :: proc "contextless" () {
 	zxdg_toplevel_decoration_v1_requests[2] = {"unset_mode", "", nil}
 	zxdg_toplevel_decoration_v1_events[0] = {"configure", "u", &zxdg_toplevel_decoration_v1_events_types_0[0]}
 	zxdg_toplevel_decoration_v1_interface = {"zxdg_toplevel_decoration_v1", 2, 3, &zxdg_toplevel_decoration_v1_requests[0], 1, &zxdg_toplevel_decoration_v1_events[0]}
+	ext_background_effect_manager_v1_requests[0] = {"destroy", "", nil}
+	ext_background_effect_manager_v1_requests[1] = {"get_background_effect", "no", &ext_background_effect_manager_v1_requests_types_1[0]}
+	ext_background_effect_manager_v1_events[0] = {"capabilities", "u", &ext_background_effect_manager_v1_events_types_0[0]}
+	ext_background_effect_manager_v1_interface = {"ext_background_effect_manager_v1", 1, 2, &ext_background_effect_manager_v1_requests[0], 1, &ext_background_effect_manager_v1_events[0]}
+	ext_background_effect_surface_v1_requests[0] = {"destroy", "", nil}
+	ext_background_effect_surface_v1_requests[1] = {"set_blur_region", "?o", &ext_background_effect_surface_v1_requests_types_1[0]}
+	ext_background_effect_surface_v1_interface = {"ext_background_effect_surface_v1", 1, 2, &ext_background_effect_surface_v1_requests[0], 0, nil}
 }
 
 // ---- wl_display ----
@@ -1559,5 +1577,39 @@ zxdg_toplevel_decoration_v1_set_mode :: proc "contextless" (self: ^zxdg_toplevel
 
 zxdg_toplevel_decoration_v1_unset_mode :: proc "contextless" (self: ^zxdg_toplevel_decoration_v1) {
 	_ = proxy_marshal_flags(cast(^Proxy)self, 2, nil, proxy_get_version(cast(^Proxy)self), 0)
+}
+
+// ---- ext_background_effect_manager_v1 ----
+
+ext_background_effect_manager_v1_error_background_effect_exists :: 0
+
+ext_background_effect_manager_v1_capability_blur :: 1
+
+ext_background_effect_manager_v1_listener :: struct {
+	capabilities: proc "c" (data: rawptr, self: ^ext_background_effect_manager_v1, flags: u32),
+}
+
+ext_background_effect_manager_v1_add_listener :: proc "contextless" (self: ^ext_background_effect_manager_v1, listener: ^ext_background_effect_manager_v1_listener, data: rawptr) -> c.int {
+	return proxy_add_listener(cast(^Proxy)self, cast([^]rawptr)listener, data)
+}
+
+ext_background_effect_manager_v1_destroy :: proc "contextless" (self: ^ext_background_effect_manager_v1) {
+	_ = proxy_marshal_flags(cast(^Proxy)self, 0, nil, proxy_get_version(cast(^Proxy)self), MARSHAL_FLAG_DESTROY)
+}
+
+ext_background_effect_manager_v1_get_background_effect :: proc "contextless" (self: ^ext_background_effect_manager_v1, surface: ^wl_surface) -> ^ext_background_effect_surface_v1 {
+	return cast(^ext_background_effect_surface_v1)proxy_marshal_flags(cast(^Proxy)self, 1, &ext_background_effect_surface_v1_interface, proxy_get_version(cast(^Proxy)self), 0, rawptr(nil), rawptr(surface))
+}
+
+// ---- ext_background_effect_surface_v1 ----
+
+ext_background_effect_surface_v1_error_surface_destroyed :: 0
+
+ext_background_effect_surface_v1_destroy :: proc "contextless" (self: ^ext_background_effect_surface_v1) {
+	_ = proxy_marshal_flags(cast(^Proxy)self, 0, nil, proxy_get_version(cast(^Proxy)self), MARSHAL_FLAG_DESTROY)
+}
+
+ext_background_effect_surface_v1_set_blur_region :: proc "contextless" (self: ^ext_background_effect_surface_v1, region: ^wl_region) {
+	_ = proxy_marshal_flags(cast(^Proxy)self, 1, nil, proxy_get_version(cast(^Proxy)self), 0, rawptr(region))
 }
 

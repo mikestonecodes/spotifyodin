@@ -10,8 +10,8 @@ import stbi "vendor:stb/image"
 
 // Alpha here is the window's own transparency: the compositor blends whatever
 // is behind it through the background and the panels.
-BG :: Color(0xd2121212)
-PANEL :: Color(0xdc181818)
+BG :: Color(0xa6121212)
+PANEL :: Color(0xb4181818)
 PANEL_HI :: Color(0xff242424)
 ACCENT :: Color(0xff54b91d) // Spotify green, RGBA8 little endian
 TEXT :: Color(0xffffffff)

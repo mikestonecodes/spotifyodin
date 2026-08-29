@@ -8,9 +8,10 @@ cd "$(dirname "$0")"
 WL_XML=/usr/share/wayland/wayland.xml
 XDG_XML=/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
 DEC_XML=/usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+BLUR_XML=/usr/share/wayland-protocols/staging/ext-background-effect/ext-background-effect-v1.xml
 
 if [ -f "$WL_XML" ] && command -v python3 >/dev/null; then
-	python3 tools/wl_gen.py src/wayland/protocol.odin "$WL_XML" "$XDG_XML" "$DEC_XML"
+	python3 tools/wl_gen.py src/wayland/protocol.odin "$WL_XML" "$XDG_XML" "$DEC_XML" "$BLUR_XML"
 fi
 
 if command -v glslc >/dev/null; then

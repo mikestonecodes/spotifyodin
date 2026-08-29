@@ -2,6 +2,7 @@ package spoticyclint
 
 import "base:runtime"
 import "core:fmt"
+import "core:os"
 import "core:strings"
 import "core:sys/linux"
 import wl "./wayland"
@@ -40,6 +41,8 @@ Window :: struct {
 	wm_base:      ^wl.xdg_wm_base,
 	seat:         ^wl.wl_seat,
 	deco_manager: ^wl.zxdg_decoration_manager_v1,
+	blur_manager: ^wl.ext_background_effect_manager_v1,
+	blur_surface: ^wl.ext_background_effect_surface_v1,
 
 	surface:      ^wl.wl_surface,
 	xdg_surface:  ^wl.xdg_surface,
@@ -174,6 +177,26 @@ window_open :: proc(w: ^Window, title: string, width, height: int) -> bool {
 		)
 	}
 
+	// Blur whatever shows through the window. The region is not optional: a
+	// NULL one removes the effect rather than covering everything, so hand it
+	// a rectangle far larger than the window and let the compositor clip it —
+	// that way it stays right across every resize without being reset.
+	if w.blur_manager != nil {
+		w.blur_surface = wl.ext_background_effect_manager_v1_get_background_effect(
+			w.blur_manager,
+			w.surface,
+		)
+		region := wl.wl_compositor_create_region(w.compositor)
+		wl.wl_region_add(region, 0, 0, 1 << 20, 1 << 20)
+		wl.ext_background_effect_surface_v1_set_blur_region(w.blur_surface, region)
+		wl.wl_region_destroy(region)
+		if os.get_env("SPOTICYCLINT_PROFILE", context.temp_allocator) != "" {
+			fmt.eprintln("background blur requested")
+		}
+	} else if os.get_env("SPOTICYCLINT_PROFILE", context.temp_allocator) != "" {
+		fmt.eprintln("compositor offers no background blur")
+	}
+
 	// The surface must be committed without a buffer, then configured, before
 	// anything (including the Vulkan swapchain) can attach to it.
 	wl.wl_surface_commit(w.surface)
@@ -220,6 +243,15 @@ on_global :: proc "c" (
 			name         = proc "c" (data: rawptr, self: ^wl.wl_seat, name: cstring) {},
 		}
 		wl.wl_seat_add_listener(w.seat, &seat_listener, w)
+	case "ext_background_effect_manager_v1":
+		// niri and friends can blur whatever shows through a translucent
+		// window. Optional: without it the window is simply see-through.
+		w.blur_manager = cast(^wl.ext_background_effect_manager_v1)wl.wl_registry_bind(
+			registry,
+			name,
+			&wl.ext_background_effect_manager_v1_interface,
+			1,
+		)
 	case "zxdg_decoration_manager_v1":
 		w.deco_manager = cast(^wl.zxdg_decoration_manager_v1)wl.wl_registry_bind(
 			registry,
@@ -376,6 +408,7 @@ window_key_pressed :: proc(w: ^Window, key: u32) -> bool {
 
 window_close :: proc(w: ^Window) {
 	delete(w.input.keys_pressed)
+	if w.blur_surface != nil do wl.ext_background_effect_surface_v1_destroy(w.blur_surface)
 	if w.decoration != nil do wl.zxdg_toplevel_decoration_v1_destroy(w.decoration)
 	if w.toplevel != nil do wl.xdg_toplevel_destroy(w.toplevel)
 	if w.xdg_surface != nil do wl.xdg_surface_destroy(w.xdg_surface)
