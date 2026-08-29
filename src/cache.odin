@@ -10,7 +10,7 @@ import "core:strings"
 // The library rarely changes but always costs ~80 requests to read, so it goes
 // to disk. On the next run one cheap request confirms the count still matches
 // before the cache is trusted.
-CACHE_VERSION :: 1
+CACHE_VERSION :: 2 // bumped when art_url moved from 64px to 300px
 
 Cached_Library :: struct {
 	version:  int,

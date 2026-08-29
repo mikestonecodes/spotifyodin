@@ -7,7 +7,7 @@ import vk "vendor:vulkan"
 // Every texture the UI can draw lives in one descriptor array, so nothing
 // between draws ever has to rebind a descriptor set: a glyph, a panel and an
 // album cover differ only by an integer in the vertex data.
-BINDLESS_CAPACITY :: 512
+BINDLESS_CAPACITY :: 1024
 
 FONT_TEX :: 0 // slot 0 is always the glyph atlas
 WHITE_TEX :: 1 // slot 1 is always a 1x1 opaque white pixel

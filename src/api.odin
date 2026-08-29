@@ -59,6 +59,9 @@ Progress :: #type proc(done, total: int, user: rawptr)
 
 PAGE :: 50
 
+// Album art is fetched at least this wide, so covers stay sharp on a grid.
+ART_MIN_PX :: 300
+
 // Fetches saved tracks into `tracks`, resuming from however many are already
 // in there. Returns false if it stopped early — the caller keeps what was
 // collected so the next attempt carries on instead of starting over.
@@ -129,11 +132,23 @@ fetch_page :: proc(
 			artist_id = jstr(artists[0], "id")
 		}
 
-		// Album art comes in three sizes, largest first; the last one is
-		// 64px, which is all a list row needs.
+		// Album art comes in three sizes (640/300/64). Take the smallest that
+		// is still at least ART_MIN_PX: the 64px one is a blurry mess on
+		// anything bigger than a list thumbnail.
 		art_url: string
-		if images := jarr(jpath(t, "album"), "images"); len(images) > 0 {
-			art_url = jstr(images[len(images) - 1], "url")
+		best_width := 0
+		for img in jarr(jpath(t, "album"), "images") {
+			url := jstr(img, "url")
+			if url == "" do continue
+			w := jnum(img, "width")
+
+			take := art_url == ""
+			if !take && best_width < ART_MIN_PX do take = w > best_width
+			if !take && w >= ART_MIN_PX do take = w < best_width
+			if take {
+				art_url = url
+				best_width = w
+			}
 		}
 
 		append(

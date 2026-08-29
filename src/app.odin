@@ -21,9 +21,13 @@ WARN :: Color(0xff4d4dff) // something needs the user's attention
 // budget the loop would render as fast as the GPU allows for no visible gain.
 FRAME_BUDGET :: 8 * time.Millisecond
 
-ROW_H :: 96
 BAR_H :: 104
-ART :: 72
+
+// Grid of covers rather than a list: at this window width a row used maybe a
+// third of it and left the rest empty.
+TILE_MIN :: 150 // smallest a cover is allowed to get before dropping a column
+TILE_GAP :: 14
+TILE_LABEL :: 46 // title and artist under each cover
 
 Command :: enum {
 	None,
@@ -173,6 +177,14 @@ run_ui :: proc(client: Client, device: string) {
 			last_state = state
 			needs_draw = true
 		}
+		// Hold to the frame budget even when the compositor is handing us a
+		// stream of pointer motion: the poll timeout alone does not cap this,
+		// because poll returns the moment an event arrives.
+		if needs_draw {
+			ahead := FRAME_BUDGET - time.since(last_draw)
+			if ahead > 0 do time.sleep(ahead)
+		}
+
 		prof_frames += 1
 		if !needs_draw {
 			if profile do report_profile(&prof_window, &prof_frames, &prof_draws, &prof_draw_ns, &prof_art_ns, &prof_build_ns, &prof_worst)
@@ -326,7 +338,7 @@ draw_app :: proc(app: ^App) {
 
 	list := Rect{0, 0, w, h - BAR_H}
 	if loaded && count > 0 {
-		draw_queue(app, list, now_uri)
+		draw_queue(app, list, now_uri, progress, duration)
 	} else {
 		ui_text_centred(ui, &ui.regular, status, list, 18, status_error ? WARN : MUTED)
 	}
@@ -345,7 +357,25 @@ draw_app :: proc(app: ^App) {
 }
 
 @(private = "file")
-draw_queue :: proc(app: ^App, r: Rect, now_uri: string) {
+Grid :: struct {
+	cols:   int,
+	tile:   f32, // cover edge, square
+	cell_w: f32,
+	cell_h: f32,
+}
+
+@(private = "file")
+grid_for :: proc(width: f32) -> (g: Grid) {
+	usable := width - TILE_GAP
+	g.cols = max(int(usable / (TILE_MIN + TILE_GAP)), 2)
+	g.cell_w = usable / f32(g.cols)
+	g.tile = g.cell_w - TILE_GAP
+	g.cell_h = g.tile + TILE_LABEL
+	return
+}
+
+@(private = "file")
+draw_queue :: proc(app: ^App, r: Rect, now_uri: string, progress, duration: int) {
 	ui := &app.ui
 	s := &app.shared
 
@@ -353,12 +383,16 @@ draw_queue :: proc(app: ^App, r: Rect, now_uri: string) {
 	count := len(s.tracks)
 	sync.unlock(&s.mutex)
 
-	ui_begin_scroll(ui, r, &app.scroll, f32(count) * ROW_H)
+	g := grid_for(r.w)
+	rows := (count + g.cols - 1) / g.cols
+	ui_begin_scroll(ui, r, &app.scroll, f32(rows) * g.cell_h + TILE_GAP)
 
-	first := max(int(app.scroll.offset / ROW_H) - 1, 0)
-	last := min(first + int(r.h / ROW_H) + 3, count)
+	first_row := max(int(app.scroll.offset / g.cell_h) - 1, 0)
+	last_row := min(first_row + int(r.h / g.cell_h) + 3, rows)
+	first := first_row * g.cols
+	last := min(last_row * g.cols, count)
 
-	// One lock for every visible row, rather than one per row per frame.
+	// One lock for everything on screen, rather than one per tile per frame.
 	visible := make([]Track, max(last - first, 0), context.temp_allocator)
 	sync.lock(&s.mutex)
 	for i in first ..< last do visible[i - first] = s.tracks[i]
@@ -366,42 +400,68 @@ draw_queue :: proc(app: ^App, r: Rect, now_uri: string) {
 
 	for track, vi in visible {
 		i := first + vi
-		row := Rect{r.x, r.y - app.scroll.offset + f32(i) * ROW_H, r.w, ROW_H}
-		if row.y > r.y + r.h || row.y + row.h < r.y do continue
+		col := i % g.cols
+		row := i / g.cols
+
+		cell := Rect {
+			r.x + TILE_GAP + f32(col) * g.cell_w,
+			r.y - app.scroll.offset + TILE_GAP + f32(row) * g.cell_h,
+			g.tile,
+			g.cell_h - TILE_GAP,
+		}
+		if cell.y > r.y + r.h || cell.y + cell.h < r.y do continue
 
 		is_now := track.uri == now_uri
-		id := ui_id("row", i)
-		clicked, hovered := ui_invisible_button(ui, id, row)
+		id := ui_id("tile", i)
+		clicked, hovered := ui_invisible_button(ui, id, cell)
 		if clicked do request_play_index(app, i)
 
-		// Hover and selection both ease in, and hovering nudges the row over.
+		// Covers lift toward the pointer and settle back; the playing one
+		// stays lifted.
 		lift := ui_anim(ui, id, hovered ? 1 : 0, 16)
 		glow := ui_anim(ui, id ~ 1, is_now ? 1 : 0, 10)
+		press := ui_anim(ui, id ~ 2, ui.active == id ? 1 : 0, 26)
+		scale := 1 + lift * 0.05 + glow * 0.02 - press * 0.05
 
-		card := rect_inset(row, 12, 6)
-		card.x += lift * 6
+		cover := Rect{cell.x, cell.y, g.tile, g.tile}
+		grow := g.tile * (scale - 1) / 2
+		cover = rect_inset(cover, -grow, -grow)
+		radius := g.tile * 0.06
+
+		// Accent ring behind the playing cover.
 		if glow > 0.01 {
-			ui_rect(ui, card, color_alpha(PANEL_HI, glow), 14)
-			ui_rect(ui, {card.x, card.y + 14, 4, card.h - 28}, color_alpha(ACCENT, glow), 2)
-		}
-		if lift > 0.01 && glow < 0.99 {
-			ui_rect(ui, card, rgba(255, 255, 255, u8(14 * lift)), 14)
+			ring := rect_inset(cover, -3 - glow * 2, -3 - glow * 2)
+			ui_rect(ui, ring, color_alpha(ACCENT, glow), radius + 4)
 		}
 
-		art := Rect{card.x + 22, row.y + (ROW_H - ART) / 2, ART, ART}
-		if slot, has := app.art[track.art_url]; has {
-			ui_image(ui, art, slot, 8)
-		} else {
-			ui_rect(ui, art, PANEL_HI, 8)
-			want_art(app, track.art_url)
+		slot, has_art := app.art[track.art_url]
+		if !has_art do want_art(app, track.art_url)
+
+		// Art fades in instead of popping.
+		fade := ui_anim(ui, id ~ 3, has_art ? 1 : 0, 8)
+		ui_rect(ui, cover, PANEL_HI, radius)
+		if has_art && fade > 0.01 {
+			ui_image(ui, cover, slot, radius, rgba(255, 255, 255, u8(255 * fade)))
 		}
 
-		text_x := art.x + ART + 22
-		text_w := row.w - text_x - 40
-		title := font_ellipsize(&ui.bold, track.name, 20, text_w)
-		artist := font_ellipsize(&ui.regular, track.artist, 15, text_w)
-		ui_text(ui, &ui.bold, title, {text_x, row.y + ROW_H / 2 - 26}, 20, is_now ? ACCENT : TEXT)
-		ui_text(ui, &ui.regular, artist, {text_x, row.y + ROW_H / 2 + 2}, 15, MUTED)
+		// Hovering brightens the cover a little.
+		if lift > 0.01 {
+			ui_rect(ui, cover, rgba(255, 255, 255, u8(18 * lift)), radius)
+		}
+
+		// The playing cover carries its own progress along the bottom edge.
+		if glow > 0.5 && duration > 0 {
+			frac := clamp(f32(progress) / f32(duration), 0, 1)
+			bar := Rect{cover.x, cover.y + cover.h - 5, cover.w, 5}
+			ui_rect(ui, bar, rgba(0, 0, 0, 130), 2.5)
+			ui_rect(ui, {bar.x, bar.y, bar.w * frac, bar.h}, ACCENT, 2.5)
+		}
+
+		text_w := g.tile - 4
+		title := font_ellipsize(&ui.bold, track.name, 14, text_w)
+		artist := font_ellipsize(&ui.regular, track.artist, 12, text_w)
+		ui_text(ui, &ui.bold, title, {cell.x + 2, cell.y + g.tile + 8}, 14, is_now ? ACCENT : TEXT)
+		ui_text(ui, &ui.regular, artist, {cell.x + 2, cell.y + g.tile + 26}, 12, MUTED)
 	}
 
 	ui_end_scroll(ui, r, &app.scroll, DIM)
@@ -631,6 +691,10 @@ want_art :: proc(app: ^App, url: string) {
 // stall the frame. Take a few per frame; the rest wait their turn.
 ART_UPLOADS_PER_FRAME :: 4
 
+// Covers are stored at this size. A tile is ~170-200 logical pixels, so this
+// is sharp, and it keeps a full bindless table down to a sane amount of VRAM.
+ART_TEXTURE_PX :: 224
+
 @(private = "file")
 upload_pending_art :: proc(app: ^App) -> (uploaded: bool) {
 	ready: [ART_UPLOADS_PER_FRAME]Art
@@ -646,7 +710,7 @@ upload_pending_art :: proc(app: ^App) -> (uploaded: bool) {
 	// Uploading touches the GPU queue, so it happens here on the render thread.
 	for a in ready[:count] {
 		app.art[a.url] = texture_upload(&app.gpu, a.pixels, a.width, a.height, 4)
-		stbi.image_free(raw_data(a.pixels))
+		delete(a.pixels)
 	}
 	return count > 0
 }
@@ -917,25 +981,45 @@ fetch_art :: proc(s: ^Shared, url: string) {
 	defer delete(res.body)
 
 	w, h, ch: i32
-	pixels := stbi.load_from_memory(
-		raw_data(res.body),
-		i32(len(res.body)),
-		&w,
-		&h,
-		&ch,
-		4,
-	)
+	pixels := stbi.load_from_memory(raw_data(res.body), i32(len(res.body)), &w, &h, &ch, 4)
 	if pixels == nil do return
+
+	// Covers arrive at 300px but a tile is nowhere near that on screen, and
+	// every slot in the bindless table costs VRAM for as long as it lives.
+	// Downscaling here keeps the whole table affordable.
+	out_w, out_h := int(w), int(h)
+	data := pixels[:out_w * out_h * 4]
+	if max(out_w, out_h) > ART_TEXTURE_PX {
+		scale := f32(ART_TEXTURE_PX) / f32(max(out_w, out_h))
+		nw := max(int(f32(out_w) * scale), 1)
+		nh := max(int(f32(out_h) * scale), 1)
+		small := make([]byte, nw * nh * 4)
+		ok := stbi.resize_uint8_srgb(
+			pixels,
+			w,
+			h,
+			0,
+			raw_data(small),
+			i32(nw),
+			i32(nh),
+			0,
+			4,
+			3, // alpha channel index
+			0,
+		)
+		stbi.image_free(pixels)
+		if ok == 0 {
+			delete(small)
+			return
+		}
+		data = small
+		out_w, out_h = nw, nh
+	}
 
 	sync.guard(&s.mutex)
 	append(
 		&s.art_ready,
-		Art {
-			url = strings.clone(url),
-			pixels = pixels[:int(w) * int(h) * 4],
-			width = int(w),
-			height = int(h),
-		},
+		Art{url = strings.clone(url), pixels = data, width = out_w, height = out_h},
 	)
 }
 

@@ -53,8 +53,8 @@ There is no client secret — auth is the PKCE flow, and tokens land in
 ./spoticyclint logout             # also clears the cached library
 ```
 
-In the window: click a row to play it, click the bar to seek, scroll the queue
-with the wheel, drag the volume slider. Space toggles play, left/right skip,
+In the window: the queue is a grid of album covers — click one to play it,
+click the bar to seek, scroll with the wheel, drag the volume slider. Space toggles play, left/right skip,
 up/down change volume, `r` reshuffles, `q`/Escape quits.
 
 Playback is native — the window decodes and plays audio itself, so no Spotify
@@ -191,7 +191,7 @@ before the last track of the current one ends.
 | --- | --- |
 | `src/main.odin` | CLI, device selection, the headless playback loop |
 | `src/app.odin` | the window's screen, and the worker thread behind it |
-| `src/ui.odin` | immediate-mode core: draw list, ids, widgets |
+| `src/ui.odin` | immediate-mode core: draw list, ids, widgets, animation |
 | `src/window.odin` | Wayland window, xdg-shell, pointer and keyboard |
 | `src/gpu.odin` | Vulkan instance, device, swapchain, per-frame state |
 | `src/gpu_bindless.odin` | the descriptor array and texture uploads |
