@@ -107,14 +107,11 @@ App :: struct {
 	pulse:        f32, // 1 -> 0 right after a change
 	now_index:    int, // where the playing track sits in the queue, or -1
 
-	// A track change flies its cover out of the grid and into the feature
-	// tile, and sends a ripple through the tiles it left behind.
-	fly:          f32, // 1 -> 0 over the transition
-	fly_from:     Rect,
-	fly_slot:     u32,
-	fly_has_art:  bool,
-	wave:         f32, // 1 -> 0, the ripple
-	wave_origin:  [2]f32,
+	// The grid holds the queue from the next track onward, so a change slides
+	// every tile back by one slot. `shift` runs 1 -> 0 across that slide and
+	// `shift_by` is how many slots the queue moved.
+	shift:        f32,
+	shift_by:     int,
 
 	// The big cover turns over when the track changes: `flip` runs 1 -> 0 and
 	// `flip_dir` decides which way, while `prev_art` is what it turns away
@@ -123,8 +120,9 @@ App :: struct {
 	flip_dir:     f32,
 	prev_art:     string,
 	now_art_url:  string,
-	feature_url:  string, // what the dedicated full-size slot currently holds
-	feature_slot: u32,
+	feature_url:   string, // what has been asked for
+	feature_shown: string, // what the full-size slot actually holds
+	feature_slot:  u32,
 	feature_ready: bool,
 	last_index:   int,
 
@@ -445,6 +443,18 @@ grid_for :: proc(width: f32, count: int) -> (g: Grid) {
 	return
 }
 
+// The rectangle a slot occupies on screen.
+@(private = "file")
+grid_slot_rect :: proc(g: Grid, area: Rect, scroll: f32, slot: int) -> Rect {
+	row, col := grid_cell(g, slot)
+	return Rect {
+		area.x + TILE_GAP + f32(col) * g.cell,
+		area.y - scroll + TILE_GAP + f32(row) * g.cell,
+		g.cell - TILE_GAP,
+		g.cell - TILE_GAP,
+	}
+}
+
 // Where the n-th track sits, with the feature block filling the top-left.
 @(private = "file")
 grid_cell :: proc(g: Grid, n: int) -> (row, col: int) {
@@ -480,13 +490,12 @@ draw_queue :: proc(
 	// The layout as it stood before this frame's change: the cover that is
 	// about to become the feature was sitting somewhere in it, and that is
 	// where its flight starts.
-	was_skipping := app.now_index >= 0 && app.now_index < count
-	previous_grid := grid_for(r.w, was_skipping ? count - 1 : count)
-	track_change_pulse(app, now_uri, previous_grid, r)
+	track_change_pulse(app, now_uri)
 
-	// The playing track is the feature tile, so the grid holds everything else.
-	skip := app.now_index >= 0 && app.now_index < count
-	flow_count := skip ? count - 1 : count
+	// The grid is the queue from the next track onward, wrapping round, so the
+	// tile beside the feature really is what plays next.
+	start := app.now_index >= 0 ? app.now_index + 1 : 0
+	flow_count := app.now_index >= 0 ? count - 1 : count
 
 	g := grid_for(r.w, flow_count)
 	ui_begin_scroll(ui, r, &app.scroll, f32(g.rows) * g.cell + TILE_GAP)
@@ -510,102 +519,79 @@ draw_queue :: proc(
 	first = clamp(first, 0, flow_count)
 	last = clamp(last, 0, flow_count)
 
-	// Slot n maps to the n-th track that is not the one playing.
+	// Slot k holds the k-th track after the one playing, wrapping round, so
+	// the tile beside the feature really is what plays next.
 	visible := make([]Track, max(last - first, 0), context.temp_allocator)
 	indices := make([]int, len(visible), context.temp_allocator)
 	sync.lock(&s.mutex)
 	for slot in first ..< last {
-		i := skip && slot >= app.now_index ? slot + 1 : slot
+		i := (start + slot) %% count
 		visible[slot - first] = s.tracks[i]
 		indices[slot - first] = i
 	}
 	sync.unlock(&s.mutex)
 
+	// A step along the queue slides every tile back one slot, so the whole
+	// grid moves instead of one tile changing underneath the pointer.
+	ease := 1 - app.shift
+	ease = 1 - (1 - ease) * (1 - ease) * (1 - ease)
+
 	for track, vi in visible {
-		row, col := grid_cell(g, first + vi)
-		i := indices[vi]
+		slot := first + vi
+		to := grid_slot_rect(g, r, app.scroll.offset, slot)
+		cell := to
+		fade: f32 = 1
 
-		cell := Rect {
-			r.x + TILE_GAP + f32(col) * g.cell,
-			r.y - app.scroll.offset + TILE_GAP + f32(row) * g.cell,
-			g.cell - TILE_GAP,
-			g.cell - TILE_GAP,
+		if app.shift > 0.001 {
+			from_slot := slot + app.shift_by
+			if from_slot >= 0 && from_slot < flow_count {
+				from := grid_slot_rect(g, r, app.scroll.offset, from_slot)
+				if abs(from.y - to.y) < g.cell * 0.5 {
+					cell.x = from.x + (to.x - from.x) * ease
+					cell.y = from.y + (to.y - from.y) * ease
+				} else {
+					// Coming from another row would fly across the window;
+					// those fade in place instead.
+					fade = ease
+				}
+			} else {
+				fade = ease
+			}
 		}
+
 		if cell.y > r.y + r.h || cell.y + cell.h < r.y do continue
-
-		draw_tile(app, cell, track, i, false)
+		draw_tile(app, cell, track, indices[vi], fade)
 	}
 
-	// Drawn last so it passes over the tiles on its way to the corner.
-	if app.fly > 0.001 && app.fly_has_art {
-		t := 1 - app.fly
-		e := 1 - (1 - t) * (1 - t) * (1 - t) // ease out, so it lands softly
-		from := app.fly_from
-		box := Rect {
-			from.x + (feature.x - from.x) * e,
-			from.y + (feature.y - from.y) * e,
-			from.w + (feature.w - from.w) * e,
-			from.h + (feature.h - from.h) * e,
-		}
-		ui_glow(
-			ui,
-			{box.x + box.w / 2, box.y + box.h / 2},
-			box.w * 0.8,
-			color_alpha(ACCENT, 0.35 * app.fly),
-		)
-		ui_image_wobble(ui, box, app.fly_slot, app.fly * 0.030, box.w * 0.05)
-	}
-
-	ui_end_scroll(ui, r, &app.scroll, DIM)
+	ui_end_scroll(ui, r, &app.scroll)
 }
 
 @(private = "file")
-draw_tile :: proc(app: ^App, cell: Rect, track: Track, i: int, is_now: bool) {
+draw_tile :: proc(app: ^App, cell: Rect, track: Track, i: int, fade_in: f32 = 1) {
 	ui := &app.ui
 	id := ui_id("tile", i)
 	clicked, hovered := ui_invisible_button(ui, id, cell)
 	if clicked do request_play_index(app, i)
 
 	lift := ui_anim(ui, id, hovered ? 1 : 0, 16)
-	glow := ui_anim(ui, id ~ 1, is_now ? 1 : 0, 10)
 	press := ui_anim(ui, id ~ 2, ui.active == id ? 1 : 0, 26)
-
-	// A ring travelling out from wherever the last track came from, so a skip
-	// visibly moves through the grid rather than only changing one tile.
-	wave: f32
-	if app.wave > 0 {
-		centre := [2]f32{cell.x + cell.w / 2, cell.y + cell.h / 2}
-		d := linalg.length(centre - app.wave_origin)
-		phase := (1 - app.wave) * 1900 - d // front travels ~1900px/sec
-		if phase > 0 && phase < 240 {
-			wave = math.sin(phase / 240 * math.PI)
-		}
-	}
-
-	scale := 1 + lift * 0.06 - press * 0.05 + wave * 0.07
+	scale := 1 + lift * 0.06 - press * 0.05
 
 	grow := cell.w * (scale - 1) / 2
 	cover := rect_inset(cell, -grow, -grow)
 	radius := cell.w * 0.055
 
-	if glow > 0.01 {
-		ui_rect(ui, rect_inset(cover, -3 - glow * 2, -3 - glow * 2), color_alpha(ACCENT, glow), radius + 4)
-	}
-
 	slot, has_art := app.art[track.art_url]
 	if !has_art do want_art(app, track.art_url)
 
-	fade := ui_anim(ui, id ~ 3, has_art ? 1 : 0, 8)
-	ui_rect(ui, cover, PANEL_HI, radius)
+	appear := clamp(fade_in, 0, 1)
+	fade := ui_anim(ui, id ~ 3, has_art ? 1 : 0, 8) * appear
+	ui_rect(ui, cover, color_alpha(PANEL_HI, appear), radius)
 	if has_art && fade > 0.01 {
-		tint := rgba(255, 255, 255, u8(255 * fade))
-		ui_image_wobble(ui, cover, slot, wave * 0.016, radius, tint)
+		ui_image(ui, cover, slot, radius, rgba(255, 255, 255, u8(255 * fade)))
 	}
 	if lift > 0.01 {
 		ui_rect(ui, cover, rgba(255, 255, 255, u8(22 * lift)), radius)
-	}
-	if wave > 0.01 {
-		ui_rect(ui, cover, color_alpha(ACCENT, wave * 0.30), radius)
 	}
 }
 
@@ -616,20 +602,37 @@ draw_feature :: proc(app: ^App, r: Rect, name, artist: string, progress, duratio
 	ui := &app.ui
 	radius := r.w * 0.035
 
-	// A small swell when the track changes, and nothing else moving.
-	pop := app.pulse * app.pulse * 0.03
+	// The swell peaks partway through the change rather than at the start, so
+	// the cover lands into place instead of decaying out of it.
+	swell := math.sin(clamp(app.pulse, 0, 1) * math.PI)
+	pop := swell * 0.06
 	cover := rect_inset(r, -r.w * pop / 2, -r.w * pop / 2)
 
-	ui_rect(ui, cover, PANEL_HI, radius)
-	settle := app.pulse * 0.018
-	if app.feature_ready {
-		ui_image_wobble(ui, cover, app.feature_slot, settle, radius)
-	} else if slot, has := current_art_slot(app); has {
-		// The small cover stands in until the full-size one arrives.
-		ui_image_wobble(ui, cover, slot, settle, radius)
+	// Light thrown off the artwork as it arrives.
+	if swell > 0.01 {
+		ui_glow(
+			ui,
+			{cover.x + cover.w / 2, cover.y + cover.h / 2},
+			cover.w * (0.62 + swell * 0.3),
+			color_alpha(ACCENT, swell * 0.5),
+		)
 	}
-	if app.pulse > 0.01 {
-		ui_rect(ui, cover, rgba(255, 255, 255, u8(40 * app.pulse)), radius)
+
+	ui_rect(ui, cover, PANEL_HI, radius)
+	settle := swell * 0.020
+
+	// Use the full-size slot only while it actually holds this track. It takes
+	// a moment to download, and showing the previous cover until it lands made
+	// clicking feel like nothing had happened.
+	big_ready := app.feature_ready && app.feature_shown == app.feature_url
+	if big_ready {
+		ui_image_wobble(ui, cover, app.feature_slot, settle, radius)
+	} else if small, has := current_art_slot(app); has {
+		// The grid already has this cover at tile size; show it at once.
+		ui_image_wobble(ui, cover, small, settle, radius)
+	}
+	if swell > 0.01 {
+		ui_rect(ui, cover, rgba(255, 255, 255, u8(55 * swell)), radius)
 	}
 
 	if name != "" {
@@ -659,22 +662,11 @@ draw_feature :: proc(app: ^App, r: Rect, name, artist: string, progress, duratio
 			ui_glow(ui, {fill.x + fill.w, bar.y + 2.5}, 12, color_alpha(ACCENT, 0.55))
 		}
 
-		elapsed := ms_to_time(progress)
-		total := ms_to_time(duration)
-		ui_text(ui, &ui.regular, elapsed, {bar.x, bar.y - 20}, 12, rgba(255, 255, 255, 200))
-		ui_text(
-			ui,
-			&ui.regular,
-			total,
-			{bar.x + bar.w - font_width(&ui.regular, total, 12), bar.y - 20},
-			12,
-			rgba(255, 255, 255, 140),
-		)
 	}
 }
 
 @(private = "file")
-track_change_pulse :: proc(app: ^App, now_uri: string, layout: Grid, area: Rect) {
+track_change_pulse :: proc(app: ^App, now_uri: string) {
 	ui := &app.ui
 	if now_uri != app.last_now_uri {
 		delete(app.last_now_uri)
@@ -701,36 +693,25 @@ track_change_pulse :: proc(app: ^App, now_uri: string, layout: Grid, area: Rect)
 		sync.unlock(&app.shared.mutex)
 		want_feature_art(app, big)
 
-		// The cover was somewhere in the grid a moment ago; fly it from there.
-		app.fly = 0
-		if app.now_index >= 0 && layout.cell > 0 {
-			slot := app.now_index
-			if previous_index >= 0 && app.now_index > previous_index do slot -= 1
-
-			row, col := grid_cell(layout, slot)
-			from := Rect {
-				area.x + TILE_GAP + f32(col) * layout.cell,
-				area.y - app.scroll.offset + TILE_GAP + f32(row) * layout.cell,
-				layout.cell - TILE_GAP,
-				layout.cell - TILE_GAP,
+		// Slide the grid only for a step along the queue. Jumping somewhere
+		// else entirely has no sensible direction to slide in.
+		app.shift = 0
+		app.shift_by = 0
+		if previous_index >= 0 && app.now_index >= 0 {
+			step := app.now_index - previous_index
+			if step == 1 || step == -1 {
+				app.shift_by = step
+				app.shift = 1
 			}
-			app.fly_from = from
-			app.fly_slot, app.fly_has_art = app.art[small]
-			app.fly = 1
-			app.wave = 1
-			app.wave_origin = {from.x + from.w / 2, from.y + from.h / 2}
 		}
+		_ = small
 	}
 	if app.pulse > 0 {
 		app.pulse = max(app.pulse - ui.dt * 2.2, 0)
 		ui.animating = true
 	}
-	if app.fly > 0 {
-		app.fly = max(app.fly - ui.dt * 2.4, 0)
-		ui.animating = true
-	}
-	if app.wave > 0 {
-		app.wave = max(app.wave - ui.dt * 1.1, 0)
+	if app.shift > 0 {
+		app.shift = max(app.shift - ui.dt * 4.5, 0)
 		ui.animating = true
 	}
 }
@@ -976,6 +957,7 @@ ART_FEATURE_PX :: 640
 
 @(private = "file")
 upload_pending_art :: proc(app: ^App) -> (uploaded: bool) {
+	needs_redraw: bool
 	ready: [ART_UPLOADS_PER_FRAME]Art
 	count := 0
 
@@ -996,13 +978,15 @@ upload_pending_art :: proc(app: ^App) -> (uploaded: bool) {
 			} else {
 				texture_replace(&app.gpu, app.feature_slot, a.pixels, a.width, a.height, 4)
 			}
-			delete(a.url)
+			delete(app.feature_shown)
+			app.feature_shown = a.url // taking ownership
+			needs_redraw = true
 		} else {
 			app.art[a.url] = texture_upload(&app.gpu, a.pixels, a.width, a.height, 4)
 		}
 		delete(a.pixels)
 	}
-	return count > 0
+	return count > 0 || needs_redraw
 }
 
 // ------------------------------------------------------------------- worker

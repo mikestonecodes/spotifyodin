@@ -446,15 +446,8 @@ ui_begin_scroll :: proc(ui: ^UI, r: Rect, s: ^Scroll, content_height: f32) {
 	ui_push_clip(ui, r)
 }
 
-ui_end_scroll :: proc(ui: ^UI, r: Rect, s: ^Scroll, thumb: Color) {
+ui_end_scroll :: proc(ui: ^UI, r: Rect, s: ^Scroll) {
 	ui_pop_clip(ui)
-	if s.content <= r.h do return
-
-	track := Rect{r.x + r.w - 6, r.y, 3, r.h}
-	frac := r.h / s.content
-	h := max(track.h * frac, 24)
-	y := track.y + (track.h - h) * clamp(s.offset / (s.content - r.h), 0, 1)
-	ui_rect(ui, {track.x, y, track.w, h}, thumb, track.w / 2)
 }
 
 ui_destroy :: proc(ui: ^UI) {
