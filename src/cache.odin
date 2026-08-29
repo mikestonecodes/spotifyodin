@@ -107,6 +107,44 @@ save_settings :: proc(settings: Settings) {
 	_ = os.write_entire_file(settings_path(), data)
 }
 
+// Tracks Spotify will not give us a key for — usually not licensed here. They
+// never become playable, so remember them and stop putting them in the queue.
+Unplayable :: struct {
+	uris: []string,
+}
+
+unplayable_path :: proc() -> string {
+	return fmt.aprintf("%s/unplayable.json", cache_dir())
+}
+
+load_unplayable :: proc() -> (set: map[string]bool) {
+	data, err := os.read_entire_file_from_path(unplayable_path(), context.allocator)
+	if err != nil do return
+	defer delete(data)
+
+	list: Unplayable
+	if json.unmarshal(data, &list) != nil do return
+	for uri in list.uris do set[uri] = true
+	delete(list.uris)
+	return
+}
+
+save_unplayable :: proc(set: map[string]bool) {
+	uris := make([]string, len(set), context.temp_allocator)
+	i := 0
+	for uri in set {
+		uris[i] = uri
+		i += 1
+	}
+
+	os.make_directory_all(cache_dir())
+	data, err := json.marshal(Unplayable{uris = uris})
+	if err != nil do return
+	defer delete(data)
+	_ = os.write_entire_file(unplayable_path(), data)
+}
+
 forget_library :: proc() {
 	_ = os.remove(library_cache_path())
+	_ = os.remove(unplayable_path())
 }

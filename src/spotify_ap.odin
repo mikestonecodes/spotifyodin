@@ -887,6 +887,18 @@ KEY_MIN_INTERVAL :: 400 * time.Millisecond
 KEY_BACKOFF_STEP :: 400 * time.Millisecond
 KEY_BACKOFF_MAX :: 4 * time.Second
 
+// How long to wait before the next key request. The caller does the waiting,
+// because it holds the socket lock and sleeping under it would stall anything
+// the user asked for behind a preload that happens to be backing off.
+ap_key_wait :: proc(s: ^AP_Session) -> time.Duration {
+	wait := KEY_MIN_INTERVAL
+	if s.refusals > 0 {
+		wait += min(KEY_BACKOFF_STEP * time.Duration(s.refusals), KEY_BACKOFF_MAX)
+	}
+	elapsed := time.since(s.last_key)
+	return elapsed < wait ? wait - elapsed : 0
+}
+
 // `transient` marks a refusal that is about us asking too much rather than the
 // recording being unavailable — those clear on their own, and trying the
 // track's alternatives only makes the throttling worse.
@@ -905,14 +917,6 @@ ap_audio_key :: proc(
 	cache_key := to_hex_string(file_id, context.temp_allocator)
 	if cached, hit := s.key_cache[cache_key]; hit do return cached, true, false
 
-	// Asking too fast is what gets the whole session refused.
-	wait := KEY_MIN_INTERVAL
-	if s.refusals > 0 {
-		wait += min(KEY_BACKOFF_STEP * time.Duration(s.refusals), KEY_BACKOFF_MAX)
-	}
-	if elapsed := time.since(s.last_key); elapsed < wait {
-		time.sleep(wait - elapsed)
-	}
 	s.last_key = time.now()
 
 	seq := s.key_seq

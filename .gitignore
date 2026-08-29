@@ -62,3 +62,4 @@ dkms.conf
 # src/shaders/*.spv and src/wayland/protocol.odin ARE committed on purpose,
 # so the project builds without glslc or the protocol XML.
 !src/shaders/*.spv
+/src.bin

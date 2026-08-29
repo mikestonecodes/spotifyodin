@@ -829,7 +829,24 @@ worker_main :: proc(app: ^App) {
 		if worker_sleep(s, wait) do return
 	}
 
-	pool := tracks[:]
+	// Drop what we already know cannot be played, so it never reaches the
+	// queue or the grid.
+	unplayable := load_unplayable()
+	defer {
+		for uri in unplayable do delete(uri)
+		delete(unplayable)
+	}
+
+	playable: [dynamic]Track
+	defer delete(playable)
+	for t in tracks {
+		if !unplayable[t.uri] do append(&playable, t)
+	}
+	if len(unplayable) > 0 {
+		fmt.eprintfln("skipping %d tracks known to be unavailable", len(unplayable))
+	}
+
+	pool := playable[:]
 	order := smart_shuffle(pool)
 
 	sync.lock(&s.mutex)
@@ -918,7 +935,8 @@ worker_main :: proc(app: ^App) {
 			publish_track(s, order[next])
 			set_status(s, fmt.tprintf("loading %s...", order[next].name))
 
-			if player_load(player, order[next].uri) {
+			loaded, permanent := player_load(player, order[next].uri)
+			if loaded {
 				index = next
 				sync.lock(&s.mutex)
 				s.is_playing = true
@@ -927,13 +945,22 @@ worker_main :: proc(app: ^App) {
 				// Get the following track ready while this one plays.
 				if index + 1 < len(order) do player_preload(player, order[index + 1].uri)
 			} else {
-				set_status(s, fmt.tprintf("could not play %s", order[next].name), true)
-				// Skip past a track we cannot play, but slowly: the usual
-				// cause is Spotify throttling key requests, and racing ahead
-				// just asks for more of them.
+				// Remember the ones that will never work, so they are not
+				// offered again on this or any later run.
+				if permanent {
+					unplayable[strings.clone(order[next].uri)] = true
+					save_unplayable(unplayable)
+					set_status(s, fmt.tprintf("%s is not available here", order[next].name), true)
+				} else {
+					set_status(s, fmt.tprintf("could not play %s", order[next].name), true)
+				}
+
+				// Skip past it, but slowly: a non-permanent failure is usually
+				// Spotify throttling key requests, and racing ahead just asks
+				// for more of them.
 				index = next
 				load_index = next + 1
-				if worker_sleep(s, 2) do return
+				if worker_sleep(s, permanent ? 0 : 2) do return
 			}
 		}
 

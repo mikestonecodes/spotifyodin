@@ -115,7 +115,7 @@ preload_worker :: proc(pre: ^Preloader) {
 			continue
 		}
 
-		audio, ok := load_track_audio(pre.session, pre.ap_mutex, pre.token, uri)
+		audio, ok, _ := load_track_audio(pre.session, pre.ap_mutex, pre.token, uri)
 
 		sync.lock(&pre.mutex)
 		if ok && pre.want == uri {
@@ -158,8 +158,10 @@ player_destroy :: proc(p: ^Player) {
 // Starts `uri`. If the preloader already has it, this is a buffer swap and
 // returns immediately; otherwise it fetches and decodes, which blocks — call it
 // from the worker thread, never from the UI thread.
-player_load :: proc(p: ^Player, uri: string) -> bool {
-	if !p.ready do return false
+// `permanent` means every candidate was hard-refused: the track is not
+// available to this account and retrying later will not help.
+player_load :: proc(p: ^Player, uri: string) -> (ok: bool, permanent: bool) {
+	if !p.ready do return false, false
 
 	samples: []i16
 
@@ -185,8 +187,8 @@ player_load :: proc(p: ^Player, uri: string) -> bool {
 
 	// Nothing ready: fetch and decode, which takes a few seconds.
 	if samples == nil {
-		audio, ok := load_track_audio(p.session, &p.ap_mutex, p.session_token, uri)
-		if !ok do return false
+		audio, loaded, hard := load_track_audio(p.session, &p.ap_mutex, p.session_token, uri)
+		if !loaded do return false, hard
 		samples = audio.samples
 	}
 
@@ -198,7 +200,7 @@ player_load :: proc(p: ^Player, uri: string) -> bool {
 	p.prev_samples = outgoing
 	p.prev_uri = p.current_uri
 	p.current_uri = strings.clone(uri)
-	return true
+	return true, false
 }
 
 // Asks for one file's key, retrying a throttled refusal rather than giving up
@@ -212,19 +214,26 @@ request_key :: proc(
 ) -> (
 	key: [16]byte,
 	ok: bool,
+	throttled: bool,
 ) {
 	KEY_RETRIES :: 3
 	for attempt in 0 ..< KEY_RETRIES {
+		// Wait out the pacing before taking the socket, never while holding it.
+		sync.lock(ap_mutex)
+		wait := ap_key_wait(session)
+		sync.unlock(ap_mutex)
+		if wait > 0 do time.sleep(wait)
+
 		sync.lock(ap_mutex)
 		k, got, transient := ap_audio_key(session, f.gid, f.file_id)
 		sync.unlock(ap_mutex)
 
-		if got do return k, true
+		if got do return k, true, false
 		// A hard refusal means this recording is not available to us; the
 		// caller should move on to an alternative.
-		if !transient do return key, false
+		if !transient do return key, false, false
 	}
-	return key, false
+	return key, false, true
 }
 
 // Resolves a track to playable samples over `session`. Tries Ogg files
@@ -238,15 +247,17 @@ load_track_audio :: proc(
 ) -> (
 	audio: Decoded_Audio,
 	ok: bool,
+	permanent: bool,
 ) {
 	gid, gid_ok := track_gid(uri)
-	if !gid_ok do return {}, false
+	if !gid_ok do return {}, false, true
 	defer delete(gid)
 
 	sync.lock(ap_mutex)
 	files, files_ok := ap_track_files(session, gid)
 	sync.unlock(ap_mutex)
-	if !files_ok || len(files) == 0 do return {}, false
+	if !files_ok do return {}, false, false
+	if len(files) == 0 do return {}, false, true
 	defer {
 		for f in files {
 			delete(f.file_id)
@@ -267,12 +278,20 @@ load_track_audio :: proc(
 	}
 
 	MAX_CANDIDATES :: 3
+	// "Unplayable" has to mean it: a track only earns that if Spotify hard
+	// refused a key for it and nothing was merely throttled along the way.
+	any_throttled := false
+	hard_refusals := 0
 	for f, attempt in candidates {
 		if attempt >= MAX_CANDIDATES do break
 
 		t0 := time.now()
-		key, key_ok := request_key(session, ap_mutex, f)
-		if !key_ok do continue
+		key, key_ok, throttled := request_key(session, ap_mutex, f)
+		if !key_ok {
+			if throttled do any_throttled = true
+			else do hard_refusals += 1
+			continue
+		}
 
 		url, url_ok := resolve_audio_url(token, f.file_id)
 		if !url_ok do continue
@@ -306,10 +325,10 @@ load_track_audio :: proc(
 			delete(decoded.samples)
 			continue
 		}
-		return decoded, true
+		return decoded, true, false
 	}
 
-	return {}, false
+	return {}, false, hard_refusals > 0 && !any_throttled
 }
 
 player_toggle :: proc(p: ^Player) -> bool {
