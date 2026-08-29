@@ -8,6 +8,7 @@ FRAG_SPV := #load("shaders/ui.frag.spv")
 
 Push :: struct {
 	inv_screen: [2]f32,
+	time:       f32,
 }
 
 create_ui_pipeline :: proc(g: ^Gpu) {
@@ -43,6 +44,7 @@ create_ui_pipeline :: proc(g: ^Gpu) {
 		{location = 3, format = .R32_UINT, offset = u32(offset_of(Vertex, tex))},
 		{location = 4, format = .R32G32B32A32_SFLOAT, offset = u32(offset_of(Vertex, rect))},
 		{location = 5, format = .R32_SFLOAT, offset = u32(offset_of(Vertex, radius))},
+		{location = 6, format = .R32_UINT, offset = u32(offset_of(Vertex, effect))},
 	}
 	vertex_input := vk.PipelineVertexInputStateCreateInfo {
 		sType                           = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
@@ -231,10 +233,8 @@ gpu_draw :: proc(g: ^Gpu, ui: ^UI, clear_color: Color) -> bool {
 	// Vertices arrive in logical units; fold the HiDPI scale in here so the
 	// UI code never has to know about it.
 	push := Push {
-		inv_screen = {
-			g.ui_scale / f32(g.extent.width),
-			g.ui_scale / f32(g.extent.height),
-		},
+		inv_screen = {g.ui_scale / f32(g.extent.width), g.ui_scale / f32(g.extent.height)},
+		time = ui.time,
 	}
 	vk.CmdPushConstants(cmd, g.pipeline_layout, {.VERTEX}, 0, size_of(Push), &push)
 

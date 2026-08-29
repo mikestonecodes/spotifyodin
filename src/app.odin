@@ -21,7 +21,7 @@ WARN :: Color(0xff4d4dff) // something needs the user's attention
 // budget the loop would render as fast as the GPU allows for no visible gain.
 FRAME_BUDGET :: 8 * time.Millisecond
 
-BAR_H :: 104
+BAR_H :: 92
 
 // Grid of covers rather than a list: at this window width a row used maybe a
 // third of it and left the rest empty.
@@ -88,6 +88,11 @@ App :: struct {
 	art_thread: ^thread.Thread,
 
 	saved_volume: f32,
+
+	// Set when the playing track changes, so the grid can react to it.
+	last_now_uri: string,
+	pulse:        f32, // 1 -> 0 right after a change
+	pulse_index:  int,
 
 	// Owned by the worker, but the UI thread calls the audio-only operations
 	// on it directly: those touch nothing but a mutex-guarded buffer, and
@@ -210,8 +215,12 @@ run_ui :: proc(client: Client, device: string) {
 
 		if profile do report_profile(&prof_window, &prof_frames, &prof_draws, &prof_draw_ns, &prof_art_ns, &prof_build_ns, &prof_worst)
 
-		// Keep drawing only while something is still moving.
+		// Keep drawing while something is still moving. Shader-clock effects
+		// also need frames, but they are slow enough to pace loosely.
 		needs_draw = app.ui.animating
+		if !needs_draw && app.ui.time_effects {
+			needs_draw = time.since(last_draw) >= 24 * time.Millisecond
+		}
 
 		// Everything the frame scratched goes back. Without this the UI grows
 		// its temp arena every frame until the whole app crawls.
@@ -398,6 +407,27 @@ draw_queue :: proc(app: ^App, r: Rect, now_uri: string, progress, duration: int)
 	for i in first ..< last do visible[i - first] = s.tracks[i]
 	sync.unlock(&s.mutex)
 
+	// Notice a track change here rather than in the worker, so the animation
+	// starts on the frame the UI first sees it.
+	if now_uri != app.last_now_uri {
+		delete(app.last_now_uri)
+		app.last_now_uri = strings.clone(now_uri)
+		app.pulse = 1
+		app.pulse_index = -1
+		sync.lock(&s.mutex)
+		for t, i in s.tracks {
+			if t.uri == now_uri {
+				app.pulse_index = i
+				break
+			}
+		}
+		sync.unlock(&s.mutex)
+	}
+	if app.pulse > 0 {
+		app.pulse = max(app.pulse - ui.dt * 1.6, 0)
+		ui.animating = true
+	}
+
 	for track, vi in visible {
 		i := first + vi
 		col := i % g.cols
@@ -421,17 +451,37 @@ draw_queue :: proc(app: ^App, r: Rect, now_uri: string, progress, duration: int)
 		lift := ui_anim(ui, id, hovered ? 1 : 0, 16)
 		glow := ui_anim(ui, id ~ 1, is_now ? 1 : 0, 10)
 		press := ui_anim(ui, id ~ 2, ui.active == id ? 1 : 0, 26)
-		scale := 1 + lift * 0.05 + glow * 0.02 - press * 0.05
+
+		// The cover that just started swells and settles.
+		pulse := i == app.pulse_index ? app.pulse : 0
+		pop := pulse * pulse * 0.14
+		scale := 1 + lift * 0.05 + glow * 0.02 - press * 0.05 + pop
 
 		cover := Rect{cell.x, cell.y, g.tile, g.tile}
 		grow := g.tile * (scale - 1) / 2
 		cover = rect_inset(cover, -grow, -grow)
 		radius := g.tile * 0.06
 
-		// Accent ring behind the playing cover.
+		// Accent ring behind the playing cover, plus a halo that breathes.
 		if glow > 0.01 {
 			ring := rect_inset(cover, -3 - glow * 2, -3 - glow * 2)
 			ui_rect(ui, ring, color_alpha(ACCENT, glow), radius + 4)
+			ui_glow(
+				ui,
+				{cover.x + cover.w / 2, cover.y + cover.h / 2},
+				g.tile * (0.85 + pulse * 0.35),
+				color_alpha(ACCENT, 0.22 * glow + pulse * 0.35),
+			)
+		}
+
+		// ... and a ring thrown outward at the moment it starts.
+		if pulse > 0.02 {
+			ui_ring(
+				ui,
+				{cover.x + cover.w / 2, cover.y + cover.h / 2},
+				g.tile * (0.55 + (1 - pulse) * 0.7),
+				color_alpha(ACCENT, pulse * 0.8),
+			)
 		}
 
 		slot, has_art := app.art[track.art_url]
@@ -467,6 +517,8 @@ draw_queue :: proc(app: ^App, r: Rect, now_uri: string, progress, duration: int)
 	ui_end_scroll(ui, r, &app.scroll, DIM)
 }
 
+// Minimal on purpose: the grid already shows what is playing, so the bar is
+// only the things you reach for — a scrub line, the transport, and volume.
 @(private = "file")
 draw_now_playing :: proc(
 	app: ^App,
@@ -479,70 +531,96 @@ draw_now_playing :: proc(
 ) {
 	ui := &app.ui
 	ui_rect(ui, r, PANEL)
-	ui_rect(ui, {r.x, r.y, r.w, 1}, rgba(255, 255, 255, 18))
 
-	art := Rect{r.x + 18, r.y + 16, 72, 72}
-	if slot, has := current_art_slot(app); has {
-		ui_image(ui, art, slot, 8)
-	} else {
-		ui_rect(ui, art, PANEL_HI, 8)
+	// The scrub line runs the full width along the top edge of the bar, and
+	// thickens when you go near it.
+	hit := Rect{r.x, r.y - 6, r.w, 20}
+	seek_clicked, seek_hovered := ui_invisible_button(ui, ui_id("seek"), hit)
+	grow := ui_anim(ui, ui_id("seekgrow"), seek_hovered || ui.active == ui_id("seek") ? 1 : 0, 18)
+
+	line_h := 3 + grow * 5
+	line := Rect{r.x, r.y, r.w, line_h}
+	ui_rect(ui, line, rgba(255, 255, 255, 20))
+
+	frac := duration > 0 ? clamp(f32(progress) / f32(duration), 0, 1) : 0
+	if frac > 0 {
+		fill := Rect{line.x, line.y, line.w * frac, line_h}
+		if grow > 0.01 do ui_rect_sheen(ui, fill, ACCENT)
+		else do ui_rect(ui, fill, ACCENT)
+		// A little light spills off the playhead.
+		ui_glow(ui, {fill.x + fill.w, line.y + line_h / 2}, 14 + grow * 10, color_alpha(ACCENT, 0.5))
+	}
+	if grow > 0.01 && duration > 0 {
+		ui_circle(ui, {line.x + line.w * frac, line.y + line_h / 2}, 4 + grow * 4, TEXT)
+	}
+	if seek_clicked && duration > 0 {
+		request_seek(app, int(clamp((ui.mouse.x - line.x) / line.w, 0, 1) * f32(duration)))
 	}
 
-	label := name == "" ? "nothing playing" : name
-	ui_text(ui, &ui.bold, font_ellipsize(&ui.bold, label, 17, 260), {art.x + 88, r.y + 22}, 17, TEXT)
-	ui_text(ui, &ui.regular, font_ellipsize(&ui.regular, artist, 14, 260), {art.x + 88, r.y + 46}, 14, MUTED)
-	if status != "" {
-		ui_text(ui, &ui.regular, font_ellipsize(&ui.regular, status, 12, 260), {art.x + 88, r.y + 68}, 12, status_error ? WARN : DIM)
-	}
+	cy := r.y + (r.h + line_h) / 2
 
-	// Transport, drawn as shapes.
+	// Times sit at the edges, quiet.
+	ui_text(ui, &ui.regular, ms_to_time(progress), {r.x + 22, cy - 8}, 13, MUTED)
+	total := ms_to_time(duration)
+	ui_text(ui, &ui.regular, total, {r.w - 22 - font_width(&ui.regular, total, 13), cy - 8}, 13, MUTED)
+
+	// Transport, centred.
 	cx := r.w / 2
-	cy := r.y + 40
-	if transport_button(ui, "prev", Rect{cx - 92, cy - 20, 40, 40}, .Previous_Icon) {
+	if transport_button(ui, "prev", Rect{cx - 104, cy - 23, 46, 46}, .Previous_Icon, false) {
 		push_command(app, .Previous)
 	}
-	if transport_button(ui, "play", Rect{cx - 26, cy - 26, 52, 52}, is_playing ? .Pause_Icon : .Play_Icon) {
+	if transport_button(ui, "play", Rect{cx - 31, cy - 31, 62, 62}, is_playing ? .Pause_Icon : .Play_Icon, true) {
 		toggle_playback(app)
 	}
-	if transport_button(ui, "next", Rect{cx + 52, cy - 20, 40, 40}, .Next_Icon) {
+	if transport_button(ui, "next", Rect{cx + 58, cy - 23, 46, 46}, .Next_Icon, false) {
 		push_command(app, .Next)
 	}
 
-	// Progress, click to seek.
-	track := Rect{cx - 240, r.y + 78, 480, 5}
-	ui_rect(ui, track, DIM, 2.5)
-	frac := duration > 0 ? f32(progress) / f32(duration) : 0
-	ui_rect(ui, {track.x, track.y, track.w * frac, track.h}, ACCENT, 2.5)
-
-	hit := Rect{track.x, track.y - 10, track.w, 24}
-	seek_clicked, seek_hovered := ui_invisible_button(ui, ui_id("seek"), hit)
-	knob := ui_anim(ui, ui_id("seekknob"), seek_hovered ? 1 : 0, 16)
-	if knob > 0.01 && duration > 0 {
-		ui_circle(ui, {track.x + track.w * frac, track.y + 2.5}, 4 + knob * 3, TEXT)
-	}
-	if seek_clicked && duration > 0 {
-		t := clamp((ui.mouse.x - track.x) / track.w, 0, 1)
-		request_seek(app, int(t * f32(duration)))
-	}
-
-	ui_text(ui, &ui.regular, ms_to_time(progress), {track.x - 52, r.y + 71}, 12, MUTED)
-	ui_text(ui, &ui.regular, ms_to_time(duration), {track.x + track.w + 12, r.y + 71}, 12, MUTED)
-
-	// Volume.
+	// Volume, deliberately large.
 	sync.lock(&app.shared.mutex)
 	volume := app.shared.volume
 	sync.unlock(&app.shared.mutex)
 
-	vol_rect := Rect{r.w - 250, r.y + 34, 110, 22}
-	draw_speaker(ui, {vol_rect.x - 26, vol_rect.y + 11}, volume, MUTED)
-	new_volume := ui_slider(ui, "volume", vol_rect, volume, DIM, ACCENT, TEXT)
+	vol := Rect{r.w - 300, cy - 14, 210, 28}
+	draw_speaker(ui, {vol.x - 30, cy}, volume, MUTED)
+	new_volume := volume_slider(ui, vol, volume)
 	if new_volume != volume {
 		player_set_volume(&app.player, new_volume)
 		sync.guard(&app.shared.mutex)
 		app.shared.volume = new_volume
 	}
 
-	if shuffle_button(ui, Rect{r.w - 118, r.y + 30, 100, 34}) do push_command(app, .Reshuffle)
+	// Errors are the only thing worth words down here.
+	if status_error {
+		ui_text(ui, &ui.regular, font_ellipsize(&ui.regular, status, 12, 300), {r.x + 22, cy + 14}, 12, WARN)
+	}
+}
+
+// Chunky and glowing: this is the one control that wants to be grabbable.
+@(private = "file")
+volume_slider :: proc(ui: ^UI, r: Rect, value: f32) -> f32 {
+	id := ui_id("volume")
+	_, hovered := ui_invisible_button(ui, id, r)
+	held := ui.active == id
+	feel := ui_anim(ui, id ~ 7, hovered || held ? 1 : 0, 18)
+
+	value := clamp(value, 0, 1)
+	if held && r.w > 0 do value = clamp((ui.mouse.x - r.x) / r.w, 0, 1)
+
+	h := 6 + feel * 4
+	bar := Rect{r.x, r.y + r.h / 2 - h / 2, r.w, h}
+	ui_rect(ui, bar, rgba(255, 255, 255, 24), h / 2)
+
+	if value > 0 {
+		fill := Rect{bar.x, bar.y, bar.w * value, h}
+		if feel > 0.01 do ui_rect_sheen(ui, fill, ACCENT, h / 2)
+		else do ui_rect(ui, fill, ACCENT, h / 2)
+		ui_glow(ui, {fill.x + fill.w, bar.y + h / 2}, 16 + feel * 12, color_alpha(ACCENT, 0.45))
+	}
+
+	knob := 7 + feel * 4
+	ui_circle(ui, {bar.x + bar.w * value, bar.y + h / 2}, knob, TEXT)
+	return value
 }
 
 Icon :: enum {
@@ -552,29 +630,35 @@ Icon :: enum {
 	Previous_Icon,
 }
 
-// A round button that grows on hover and dips when pressed.
+// Grows toward the pointer, dips when pressed, throws a ripple when it fires,
+// and the primary button carries a glow that breathes.
 @(private = "file")
-transport_button :: proc(ui: ^UI, label: string, r: Rect, icon: Icon) -> bool {
+transport_button :: proc(ui: ^UI, label: string, r: Rect, icon: Icon, primary: bool) -> bool {
 	id := ui_id(label)
 	clicked, hovered := ui_invisible_button(ui, id, r)
 
-	press := ui_anim(ui, id ~ 2, ui.active == id ? 1 : 0, 26)
+	press := ui_anim(ui, id ~ 2, ui.active == id ? 1 : 0, 30)
 	hover := ui_anim(ui, id, hovered ? 1 : 0, 18)
-	scale := 1 + hover * 0.08 - press * 0.12
+	// Rises to 1 the moment it is clicked, then falls back on its own.
+	ripple := ui_anim(ui, id ~ 5, clicked ? 1 : 0, clicked ? 60 : 3)
+	scale := 1 + hover * 0.10 - press * 0.14
 
 	c := [2]f32{r.x + r.w / 2, r.y + r.h / 2}
 	radius := r.w / 2 * scale
-	primary := icon == .Play_Icon || icon == .Pause_Icon
+
+	if ripple > 0.02 {
+		ui_ring(ui, c, radius * (1 + (1 - ripple) * 1.5), color_alpha(ACCENT, ripple * 0.7))
+	}
 
 	if primary {
-		ui_circle(ui, c, radius, color_mix(TEXT, ACCENT, hover))
+		ui_glow(ui, c, radius * (2.1 + hover * 0.5), color_alpha(ACCENT, 0.30 + hover * 0.35))
+		ui_circle(ui, c, radius, color_mix(TEXT, ACCENT, hover * 0.85))
 	} else if hover > 0.01 {
-		ui_circle(ui, c, radius, rgba(255, 255, 255, u8(22 * hover)))
+		ui_circle(ui, c, radius, rgba(255, 255, 255, u8(26 * hover)))
 	}
 
 	fg := primary ? BG : color_mix(MUTED, TEXT, hover)
-	size := r.w * 0.3 * scale
-	draw_icon(ui, c, size, icon, fg)
+	draw_icon(ui, c, r.w * 0.3 * scale, icon, fg)
 	return clicked
 }
 
@@ -611,32 +695,6 @@ draw_icon :: proc(ui: ^UI, c: [2]f32, size: f32, icon: Icon, col: Color) {
 		ui_tri(ui, {right, c.y - size}, {right - w, c.y}, {right, c.y + size}, col)
 		ui_rect(ui, {right - w - bar * 1.2, c.y - size, bar, size * 2}, col, bar / 3)
 	}
-}
-
-// Two crossing arrows, drawn rather than spelled.
-@(private = "file")
-shuffle_button :: proc(ui: ^UI, r: Rect) -> bool {
-	id := ui_id("shuffle")
-	clicked, hovered := ui_invisible_button(ui, id, r)
-	hover := ui_anim(ui, id, hovered ? 1 : 0, 18)
-	press := ui_anim(ui, id ~ 2, ui.active == id ? 1 : 0, 26)
-
-	ui_rect(ui, r, rgba(255, 255, 255, u8(12 + 26 * hover - 6 * press)), r.h / 2)
-
-	col := color_mix(MUTED, TEXT, hover)
-	c := [2]f32{r.x + r.w / 2, r.y + r.h / 2}
-	w := f32(11)
-	th := f32(2)
-
-	// Two strands that cross in the middle, with arrowheads on the right.
-	ui_rect(ui, {c.x - w, c.y - 5, w * 0.8, th}, col, 1)
-	ui_rect(ui, {c.x - w, c.y + 3, w * 0.8, th}, col, 1)
-	ui_rect(ui, {c.x - w * 0.45, c.y - 5, th, 10}, col, 1)
-	ui_rect(ui, {c.x - w * 0.45, c.y - 5, w * 0.9, th}, col, 1)
-	ui_rect(ui, {c.x - w * 0.45, c.y + 3, w * 0.9, th}, col, 1)
-	ui_tri(ui, {c.x + w * 0.5, c.y - 9}, {c.x + w * 0.5, c.y - 1}, {c.x + w, c.y - 5}, col)
-	ui_tri(ui, {c.x + w * 0.5, c.y - 1}, {c.x + w * 0.5, c.y + 7}, {c.x + w, c.y + 3}, col)
-	return clicked
 }
 
 // A speaker whose waves come and go with the level.

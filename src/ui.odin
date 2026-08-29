@@ -35,6 +35,15 @@ color_mix :: proc "contextless" (a, b: Color, t: f32) -> Color {
 	return Color(out)
 }
 
+// Which shader path this vertex takes. Matches the EFFECT_* constants in
+// src/shaders/ui.frag.
+Effect :: enum u32 {
+	None  = 0,
+	Glow  = 1, // soft radial falloff
+	Sheen = 2, // travelling highlight
+	Ring  = 3, // fading annulus
+}
+
 Vertex :: struct {
 	pos:    [2]f32,
 	uv:     [2]f32,
@@ -42,6 +51,7 @@ Vertex :: struct {
 	tex:    u32,
 	rect:   [4]f32, // centre + half extent, for the rounded-corner mask
 	radius: f32,
+	effect: Effect,
 }
 
 DrawCmd :: struct {
@@ -74,8 +84,12 @@ UI :: struct {
 	// Animation state is the one thing that survives between frames, keyed by
 	// widget id. Values chase a target so nothing in the UI snaps.
 	dt:         f32,
+	time:       f32, // seconds since start, for the animated shader effects
 	anim:       map[u64]f32,
 	animating:  bool, // set while any value is still chasing its target
+	// Set when something on screen is driven by the shader clock, which only
+	// advances on a redraw. Kept separate so it can be paced more loosely.
+	time_effects: bool,
 }
 
 // Eases `id`'s stored value toward `target`. `speed` is roughly "how much of
@@ -120,6 +134,7 @@ ui_id :: proc "contextless" (label: string, index: int = 0) -> u64 {
 
 ui_begin :: proc(ui: ^UI, width, height: int, input: ^Input, dt: f32 = 1.0 / 60) {
 	ui.dt = clamp(dt, 0, 0.1)
+	ui.time += ui.dt
 	clear(&ui.verts)
 	clear(&ui.indices)
 	clear(&ui.cmds)
@@ -136,6 +151,7 @@ ui_begin :: proc(ui: ^UI, width, height: int, input: ^Input, dt: f32 = 1.0 / 60)
 	ui.scroll = input.scroll
 	ui.hot = 0
 	ui.animating = false
+	ui.time_effects = false
 }
 
 ui_end :: proc(ui: ^UI) {
@@ -165,7 +181,15 @@ current_cmd :: proc(ui: ^UI) -> ^DrawCmd {
 	return &ui.cmds[len(ui.cmds) - 1]
 }
 
-ui_quad :: proc(ui: ^UI, r: Rect, uv0, uv1: [2]f32, col: Color, tex: u32, radius: f32) {
+ui_quad :: proc(
+	ui: ^UI,
+	r: Rect,
+	uv0, uv1: [2]f32,
+	col: Color,
+	tex: u32,
+	radius: f32,
+	effect: Effect = .None,
+) {
 	if r.w <= 0 || r.h <= 0 do return
 	if rect_intersect(r, ui.clip).w <= 0 do return
 
@@ -173,10 +197,10 @@ ui_quad :: proc(ui: ^UI, r: Rect, uv0, uv1: [2]f32, col: Color, tex: u32, radius
 	base := u32(len(ui.verts))
 	shape := [4]f32{r.x + r.w / 2, r.y + r.h / 2, r.w / 2, r.h / 2}
 
-	append(&ui.verts, Vertex{{r.x, r.y}, uv0, col, tex, shape, radius})
-	append(&ui.verts, Vertex{{r.x + r.w, r.y}, {uv1.x, uv0.y}, col, tex, shape, radius})
-	append(&ui.verts, Vertex{{r.x + r.w, r.y + r.h}, uv1, col, tex, shape, radius})
-	append(&ui.verts, Vertex{{r.x, r.y + r.h}, {uv0.x, uv1.y}, col, tex, shape, radius})
+	append(&ui.verts, Vertex{{r.x, r.y}, uv0, col, tex, shape, radius, effect})
+	append(&ui.verts, Vertex{{r.x + r.w, r.y}, {uv1.x, uv0.y}, col, tex, shape, radius, effect})
+	append(&ui.verts, Vertex{{r.x + r.w, r.y + r.h}, uv1, col, tex, shape, radius, effect})
+	append(&ui.verts, Vertex{{r.x, r.y + r.h}, {uv0.x, uv1.y}, col, tex, shape, radius, effect})
 
 	append(&ui.indices, base, base + 1, base + 2, base, base + 2, base + 3)
 	cmd.index_count += 6
@@ -188,15 +212,33 @@ ui_tri :: proc(ui: ^UI, a, b, c: [2]f32, col: Color) {
 	base := u32(len(ui.verts))
 	shape := [4]f32{0, 0, 0, 0}
 
-	append(&ui.verts, Vertex{a, {0, 0}, col, WHITE_TEX, shape, NO_ROUND})
-	append(&ui.verts, Vertex{b, {1, 0}, col, WHITE_TEX, shape, NO_ROUND})
-	append(&ui.verts, Vertex{c, {1, 1}, col, WHITE_TEX, shape, NO_ROUND})
+	append(&ui.verts, Vertex{a, {0, 0}, col, WHITE_TEX, shape, NO_ROUND, .None})
+	append(&ui.verts, Vertex{b, {1, 0}, col, WHITE_TEX, shape, NO_ROUND, .None})
+	append(&ui.verts, Vertex{c, {1, 1}, col, WHITE_TEX, shape, NO_ROUND, .None})
 	append(&ui.indices, base, base + 1, base + 2)
 	cmd.index_count += 3
 }
 
 ui_rect :: proc(ui: ^UI, r: Rect, col: Color, radius: f32 = NO_ROUND) {
 	ui_quad(ui, r, {0, 0}, {1, 1}, col, WHITE_TEX, radius)
+}
+
+// A soft light source. Draw it behind whatever it should be lighting.
+ui_glow :: proc(ui: ^UI, centre: [2]f32, radius: f32, col: Color) {
+	r := Rect{centre.x - radius, centre.y - radius, radius * 2, radius * 2}
+	ui_quad(ui, r, {0, 0}, {1, 1}, col, WHITE_TEX, NO_ROUND, .Glow)
+}
+
+// An expanding ring, for the ripple a click leaves behind.
+ui_ring :: proc(ui: ^UI, centre: [2]f32, radius: f32, col: Color) {
+	r := Rect{centre.x - radius, centre.y - radius, radius * 2, radius * 2}
+	ui_quad(ui, r, {0, 0}, {1, 1}, col, WHITE_TEX, NO_ROUND, .Ring)
+}
+
+// A filled bar with a highlight travelling along it.
+ui_rect_sheen :: proc(ui: ^UI, r: Rect, col: Color, radius: f32 = NO_ROUND) {
+	ui.time_effects = true
+	ui_quad(ui, r, {0, 0}, {1, 1}, col, WHITE_TEX, radius, .Sheen)
 }
 
 ui_circle :: proc(ui: ^UI, centre: [2]f32, radius: f32, col: Color) {
