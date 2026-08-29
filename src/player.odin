@@ -201,6 +201,32 @@ player_load :: proc(p: ^Player, uri: string) -> bool {
 	return true
 }
 
+// Asks for one file's key, retrying a throttled refusal rather than giving up
+// on the track. The session paces and backs off on its own, so each retry
+// waits longer than the last.
+@(private = "file")
+request_key :: proc(
+	session: ^AP_Session,
+	ap_mutex: ^sync.Mutex,
+	f: Audio_File,
+) -> (
+	key: [16]byte,
+	ok: bool,
+) {
+	KEY_RETRIES :: 3
+	for attempt in 0 ..< KEY_RETRIES {
+		sync.lock(ap_mutex)
+		k, got, transient := ap_audio_key(session, f.gid, f.file_id)
+		sync.unlock(ap_mutex)
+
+		if got do return k, true
+		// A hard refusal means this recording is not available to us; the
+		// caller should move on to an alternative.
+		if !transient do return key, false
+	}
+	return key, false
+}
+
 // Resolves a track to playable samples over `session`. Tries Ogg files
 // best-quality-first, and falls through to the alternatives when Spotify will
 // not hand over a key for the original recording.
@@ -240,20 +266,13 @@ load_track_audio :: proc(
 		}
 	}
 
-	MAX_ATTEMPTS :: 3
+	MAX_CANDIDATES :: 3
 	for f, attempt in candidates {
-		if attempt >= MAX_ATTEMPTS do break
+		if attempt >= MAX_CANDIDATES do break
 
 		t0 := time.now()
-		sync.lock(ap_mutex)
-		key, key_ok, transient := ap_audio_key(session, f.gid, f.file_id)
-		sync.unlock(ap_mutex)
-		if !key_ok {
-			// Being throttled is not this recording's fault: stop rather than
-			// burning more requests on its alternatives.
-			if transient do break
-			continue
-		}
+		key, key_ok := request_key(session, ap_mutex, f)
+		if !key_ok do continue
 
 		url, url_ok := resolve_audio_url(token, f.file_id)
 		if !url_ok do continue

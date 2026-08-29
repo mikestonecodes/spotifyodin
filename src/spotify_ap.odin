@@ -942,16 +942,23 @@ ap_audio_key :: proc(
 		case PACKET_AES_KEY_ERROR:
 			defer delete(payload)
 			code := len(payload) >= 6 ? int(payload[4]) << 8 | int(payload[5]) : -1
-			s.refusals += 1
-			// Code 2 shows up on tracks that play fine minutes later, so treat
-			// it as "slow down" rather than "unavailable".
+			// Only throttling should widen the backoff. A track that simply
+			// is not available to us says nothing about how fast we are
+			// asking, and letting it slow every later request would punish
+			// the whole queue for one bad song.
+			if code == 2 do s.refusals += 1
+			// Code 2 shows up on tracks that play fine moments later, so treat
+			// it as "slow down" rather than "unavailable". The caller retries,
+			// and each retry waits longer, so this is only worth reporting
+			// once it has become persistent.
 			transient = code == 2
-			fmt.eprintfln(
-				"Spotify refused the audio key (code %d, refusal %d)%s",
-				code,
-				s.refusals,
-				transient ? " - backing off" : "",
-			)
+			if !transient || s.refusals % 8 == 0 {
+				fmt.eprintfln(
+					"Spotify refused the audio key (code %d, %d in a row)",
+					code,
+					s.refusals,
+				)
+			}
 			return key, false, transient
 		case PACKET_PING:
 			ap_send(s, PACKET_PONG, payload)
