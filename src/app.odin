@@ -83,6 +83,8 @@ App :: struct {
 	worker:  ^thread.Thread,
 	art_thread: ^thread.Thread,
 
+	saved_volume: f32,
+
 	// Owned by the worker, but the UI thread calls the audio-only operations
 	// on it directly: those touch nothing but a mutex-guarded buffer, and
 	// routing them through the worker queue added a 100ms delay to every
@@ -96,7 +98,7 @@ run_ui :: proc(client: Client, device: string) {
 	app.client = client
 	app.shared.play_index = -1
 	app.shared.seek_ms = -1
-	app.shared.volume = 1
+	app.shared.volume = load_settings().volume
 	app.shared.volume_set = -1
 	app.shared.status = strings.clone("connecting...")
 	app.shared.device = strings.clone(device)
@@ -749,6 +751,12 @@ worker_main :: proc(app: ^App) {
 	defer player_destroy(player)
 
 	sync.lock(&s.mutex)
+	volume := s.volume
+	sync.unlock(&s.mutex)
+	player_set_volume(player, volume)
+	app.saved_volume = volume
+
+	sync.lock(&s.mutex)
 	delete(s.device)
 	s.device = strings.clone("native")
 	sync.unlock(&s.mutex)
@@ -825,6 +833,15 @@ worker_main :: proc(app: ^App) {
 				load_index = next + 1
 				if worker_sleep(s, 1) do return
 			}
+		}
+
+		// Persist the volume once it stops moving, not on every drag frame.
+		sync.lock(&s.mutex)
+		current_volume := s.volume
+		sync.unlock(&s.mutex)
+		if abs(current_volume - app.saved_volume) > 0.001 {
+			app.saved_volume = current_volume
+			save_settings(Settings{volume = current_volume})
 		}
 
 		pos := player_position(player)

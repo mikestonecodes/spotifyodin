@@ -76,6 +76,37 @@ os_write_file :: proc(path: string, data: []byte) -> bool {
 	return os.write_entire_file(path, data) == nil
 }
 
+// Small persisted preferences. Kept beside the token rather than in the cache,
+// since losing these is annoying rather than merely slow.
+Settings :: struct {
+	volume: f32,
+}
+
+settings_path :: proc() -> string {
+	return fmt.aprintf("%s/settings.json", config_dir())
+}
+
+load_settings :: proc() -> Settings {
+	settings := Settings {
+		volume = 1,
+	}
+	data, err := os.read_entire_file_from_path(settings_path(), context.allocator)
+	if err != nil do return settings
+	defer delete(data)
+
+	if json.unmarshal(data, &settings) != nil do return Settings{volume = 1}
+	settings.volume = clamp(settings.volume, 0, 1)
+	return settings
+}
+
+save_settings :: proc(settings: Settings) {
+	os.make_directory_all(config_dir())
+	data, err := json.marshal(settings)
+	if err != nil do return
+	defer delete(data)
+	_ = os.write_entire_file(settings_path(), data)
+}
+
 forget_library :: proc() {
 	_ = os.remove(library_cache_path())
 }

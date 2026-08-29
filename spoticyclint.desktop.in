@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=spoticyclint
+GenericName=Music Player
+Comment=Smart-shuffle your liked Spotify songs, played natively
+Exec=@BINARY@ ui
+Icon=spoticyclint
+Terminal=false
+Categories=AudioVideo;Audio;Player;
+Keywords=spotify;music;player;shuffle;
+StartupNotify=true
