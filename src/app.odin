@@ -1,6 +1,7 @@
 package spoticyclint
 
 import "core:fmt"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -15,6 +16,10 @@ TEXT :: Color(0xffffffff)
 MUTED :: Color(0xffb3b3b3)
 DIM :: Color(0xff535353)
 WARN :: Color(0xff4d4dff) // something needs the user's attention
+
+// Ceiling on animation frames. Mailbox present does not block, so without a
+// budget the loop would render as fast as the GPU allows for no visible gain.
+FRAME_BUDGET :: 8 * time.Millisecond
 
 ROW_H :: 96
 BAR_H :: 104
@@ -57,6 +62,7 @@ Shared :: struct {
 	is_playing:   bool,
 	last_poll:    time.Time,
 
+	wake:         sync.Sema,
 	commands:     [dynamic]Command,
 	play_index:   int, // >= 0 means "start the queue here"
 	seek_ms:      int, // >= 0 means "seek the current track here"
@@ -75,6 +81,13 @@ App :: struct {
 	scroll:  Scroll,
 	art:     map[string]u32,
 	worker:  ^thread.Thread,
+	art_thread: ^thread.Thread,
+
+	// Owned by the worker, but the UI thread calls the audio-only operations
+	// on it directly: those touch nothing but a mutex-guarded buffer, and
+	// routing them through the worker queue added a 100ms delay to every
+	// pause, seek and volume change.
+	player:  Player,
 }
 
 run_ui :: proc(client: Client, device: string) {
@@ -110,19 +123,32 @@ run_ui :: proc(client: Client, device: string) {
 	defer ui_destroy(&app.ui)
 
 	app.worker = thread.create_and_start_with_poly_data(app, worker_main)
+	app.art_thread = thread.create_and_start_with_poly_data(&app.shared, art_worker)
 
 	last_frame := time.now()
+	last_draw := time.now()
 	last_state: Frame_State
 	needs_draw := true
 
+	// SPOTICYCLINT_PROFILE=1 prints where the frame time actually goes.
+	profile := os.get_env("SPOTICYCLINT_PROFILE", context.temp_allocator) != ""
+	prof_window := time.now()
+	prof_frames, prof_draws := 0, 0
+	prof_draw_ns, prof_art_ns, prof_build_ns: f64
+	prof_worst: f64
+
 	for !app.win.should_close {
-		// Nothing to draw means nothing to burn: wait on the compositor
-		// instead of spinning. Mid-animation we return immediately, while
-		// playing we wake often enough to move the progress bar, and when the
-		// window is just sitting there we barely wake at all.
+		// Nothing to draw means nothing to burn: wait on the compositor rather
+		// than spinning. Mid-animation the wait is only as long as the frame
+		// budget, so animation stays smooth without running flat out; input
+		// cuts any of these waits short, so clicks are still handled at once.
 		timeout: i32 = 500
-		if needs_draw do timeout = 0
-		else if last_state.playing do timeout = 200
+		if needs_draw {
+			left := FRAME_BUDGET - time.since(last_draw)
+			timeout = left > 0 ? i32(time.duration_milliseconds(left)) : 0
+		} else if last_state.playing {
+			timeout = 200
+		}
 		window_poll(&app.win, timeout)
 
 		now := time.now()
@@ -134,7 +160,9 @@ run_ui :: proc(client: Client, device: string) {
 			gpu_resize(&app.gpu, window_pixel_size(&app.win))
 			needs_draw = true
 		}
+		art_start := time.now()
 		if upload_pending_art(app) do needs_draw = true
+		prof_art_ns += time.duration_milliseconds(time.since(art_start))
 		if window_has_input(&app.win) do needs_draw = true
 		handle_keys(app)
 
@@ -143,15 +171,30 @@ run_ui :: proc(client: Client, device: string) {
 			last_state = state
 			needs_draw = true
 		}
-		if !needs_draw do continue
+		prof_frames += 1
+		if !needs_draw {
+			if profile do report_profile(&prof_window, &prof_frames, &prof_draws, &prof_draw_ns, &prof_art_ns, &prof_build_ns, &prof_worst)
+			continue
+		}
 
+		last_draw = time.now()
+		build_start := time.now()
 		ui_begin(&app.ui, app.win.width, app.win.height, &app.win.input, dt)
 		draw_app(app)
 		ui_end(&app.ui)
+		build_ms := time.duration_milliseconds(time.since(build_start))
+		prof_build_ns += build_ms
 
+		draw_start := time.now()
 		if !gpu_draw(&app.gpu, &app.ui, BG) {
 			gpu_resize(&app.gpu, window_pixel_size(&app.win))
 		}
+		draw_ms := time.duration_milliseconds(time.since(draw_start))
+		prof_draw_ns += draw_ms
+		prof_draws += 1
+		prof_worst = max(prof_worst, build_ms + draw_ms)
+
+		if profile do report_profile(&prof_window, &prof_frames, &prof_draws, &prof_draw_ns, &prof_art_ns, &prof_build_ns, &prof_worst)
 
 		// Keep drawing only while something is still moving.
 		needs_draw = app.ui.animating
@@ -168,6 +211,23 @@ run_ui :: proc(client: Client, device: string) {
 // Everything the window shows, boiled down to something comparable. If this
 // hasn't changed and nothing is animating, the last frame is still correct and
 // there is no reason to draw another one.
+@(private = "file")
+report_profile :: proc(window: ^time.Time, frames, draws: ^int, draw, art, build, worst: ^f64) {
+	if time.duration_seconds(time.since(window^)) < 1 do return
+	fmt.eprintfln(
+		"%3d frames, %3d drawn | build %5.2fms  gpu %5.2fms  art %5.2fms | worst %5.2fms",
+		frames^,
+		draws^,
+		build^ / f64(max(draws^, 1)),
+		draw^ / f64(max(draws^, 1)),
+		art^,
+		worst^,
+	)
+	window^ = time.now()
+	frames^, draws^ = 0, 0
+	draw^, art^, build^, worst^ = 0, 0, 0, 0
+}
+
 @(private = "file")
 Frame_State :: struct {
 	now_uri:      u64,
@@ -210,7 +270,7 @@ handle_keys :: proc(app: ^App) {
 	if window_key_pressed(&app.win, KEY_ESC) || window_key_pressed(&app.win, KEY_Q) {
 		app.win.should_close = true
 	}
-	if window_key_pressed(&app.win, KEY_SPACE) do push_command(app, .Toggle)
+	if window_key_pressed(&app.win, KEY_SPACE) do toggle_playback(app)
 	if window_key_pressed(&app.win, KEY_RIGHT) do push_command(app, .Next)
 	if window_key_pressed(&app.win, KEY_LEFT) do push_command(app, .Previous)
 	if window_key_pressed(&app.win, KEY_R) do push_command(app, .Reshuffle)
@@ -219,16 +279,20 @@ handle_keys :: proc(app: ^App) {
 	if window_key_pressed(&app.win, KEY_UP) do step = 0.05
 	if window_key_pressed(&app.win, KEY_DOWN) do step = -0.05
 	if step != 0 {
-		sync.guard(&app.shared.mutex)
+		sync.lock(&app.shared.mutex)
 		app.shared.volume = clamp(app.shared.volume + step, 0, 1)
-		app.shared.volume_set = app.shared.volume
+		volume := app.shared.volume
+		sync.unlock(&app.shared.mutex)
+		player_set_volume(&app.player, volume)
 	}
 }
 
 @(private = "file")
 push_command :: proc(app: ^App, cmd: Command) {
-	sync.guard(&app.shared.mutex)
+	sync.lock(&app.shared.mutex)
 	append(&app.shared.commands, cmd)
+	sync.unlock(&app.shared.mutex)
+	sync.sema_post(&app.shared.wake)
 }
 
 // ---------------------------------------------------------------- rendering
@@ -380,7 +444,7 @@ draw_now_playing :: proc(
 		push_command(app, .Previous)
 	}
 	if transport_button(ui, "play", Rect{cx - 26, cy - 26, 52, 52}, is_playing ? .Pause_Icon : .Play_Icon) {
-		push_command(app, .Toggle)
+		toggle_playback(app)
 	}
 	if transport_button(ui, "next", Rect{cx + 52, cy - 20, 40, 40}, .Next_Icon) {
 		push_command(app, .Next)
@@ -415,10 +479,9 @@ draw_now_playing :: proc(
 	draw_speaker(ui, {vol_rect.x - 26, vol_rect.y + 11}, volume, MUTED)
 	new_volume := ui_slider(ui, "volume", vol_rect, volume, DIM, ACCENT, TEXT)
 	if new_volume != volume {
-		sync.lock(&app.shared.mutex)
+		player_set_volume(&app.player, new_volume)
+		sync.guard(&app.shared.mutex)
 		app.shared.volume = new_volume
-		app.shared.volume_set = new_volume
-		sync.unlock(&app.shared.mutex)
 	}
 
 	if shuffle_button(ui, Rect{r.w - 118, r.y + 30, 100, 34}) do push_command(app, .Reshuffle)
@@ -563,7 +626,7 @@ want_art :: proc(app: ^App, url: string) {
 	sync.guard(&app.shared.mutex)
 	if app.shared.art_inflight[url] do return
 	app.shared.art_inflight[url] = true
-	append(&app.shared.art_wanted, url)
+	append(&app.shared.art_wanted, strings.clone(url))
 }
 
 // Each upload waits on the queue, so a scroll that queues fifty covers would
@@ -594,14 +657,25 @@ upload_pending_art :: proc(app: ^App) -> (uploaded: bool) {
 
 @(private = "file")
 request_play_index :: proc(app: ^App, index: int) {
-	sync.guard(&app.shared.mutex)
+	sync.lock(&app.shared.mutex)
 	app.shared.play_index = index
+	sync.unlock(&app.shared.mutex)
+	sync.sema_post(&app.shared.wake)
 }
 
 @(private = "file")
+// Applied straight away on the UI thread; the shared copy is updated too so
+// the next frame draws the new position without waiting for the worker.
 request_seek :: proc(app: ^App, ms: int) {
+	player_seek(&app.player, ms)
 	sync.guard(&app.shared.mutex)
-	app.shared.seek_ms = ms
+	app.shared.progress_ms = ms
+}
+
+toggle_playback :: proc(app: ^App) {
+	playing := player_toggle(&app.player)
+	sync.guard(&app.shared.mutex)
+	app.shared.is_playing = playing
 }
 
 // Uses the cached library when the song count still matches, so a restart is
@@ -666,13 +740,13 @@ worker_main :: proc(app: ^App) {
 	sync.unlock(&s.mutex)
 	set_status(s, fmt.tprintf("%d songs", len(order)))
 
-	player: Player
-	for attempt := 0; !player_init(&player, c); attempt += 1 {
+	player := &app.player
+	for attempt := 0; !player_init(player, c); attempt += 1 {
 		wait := min(5 << uint(min(attempt, 4)), 60)
 		set_status(s, fmt.tprintf("player unavailable; retrying in %ds", wait), true)
 		if worker_sleep(s, wait) do return
 	}
-	defer player_destroy(&player)
+	defer player_destroy(player)
 
 	sync.lock(&s.mutex)
 	delete(s.device)
@@ -692,9 +766,6 @@ worker_main :: proc(app: ^App) {
 		s.play_index = -1
 		seek_ms := s.seek_ms
 		s.seek_ms = -1
-		wanted := make([]string, len(s.art_wanted), context.temp_allocator)
-		copy(wanted, s.art_wanted[:])
-		clear(&s.art_wanted)
 		sync.unlock(&s.mutex)
 
 		if quit do return
@@ -704,13 +775,13 @@ worker_main :: proc(app: ^App) {
 			case .None:
 			case .Toggle:
 				if index < 0 do load_index = 0
-				else do player_toggle(&player)
+				else do player_toggle(player)
 			case .Next:
 				load_index = index + 1
 			case .Previous:
 				// Restart the track first, like every other player.
-				pos := player_position(&player)
-				if pos.position_ms > 3000 do player_seek(&player, 0)
+				pos := player_position(player)
+				if pos.position_ms > 3000 do player_seek(player, 0)
 				else do load_index = index - 1
 			case .Reshuffle:
 				new_order := smart_shuffle(pool)
@@ -724,17 +795,12 @@ worker_main :: proc(app: ^App) {
 			}
 		}
 
-		if seek_ms >= 0 do player_seek(&player, seek_ms)
+		if seek_ms >= 0 do player_seek(player, seek_ms)
 
-		sync.lock(&s.mutex)
-		volume_set := s.volume_set
-		s.volume_set = -1
-		sync.unlock(&s.mutex)
-		if volume_set >= 0 do player_set_volume(&player, volume_set)
 		if play_index >= 0 do load_index = play_index
 
 		// A track that ran out advances the queue.
-		if player_track_ended(&player) && load_index < 0 do load_index = index + 1
+		if player_track_ended(player) && load_index < 0 do load_index = index + 1
 
 		if load_index >= 0 {
 			next := load_index
@@ -743,12 +809,15 @@ worker_main :: proc(app: ^App) {
 			if next < 0 do next = len(order) - 1
 
 			set_status(s, fmt.tprintf("loading %s...", order[next].name))
-			if player_load(&player, order[next].uri) {
+			if player_load(player, order[next].uri) {
 				index = next
 				publish_track(s, order[index])
+				sync.lock(&s.mutex)
+				s.is_playing = true
+				sync.unlock(&s.mutex)
 				set_status(s, fmt.tprintf("%d songs", len(order)))
 				// Get the following track ready while this one plays.
-				if index + 1 < len(order) do player_preload(&player, order[index + 1].uri)
+				if index + 1 < len(order) do player_preload(player, order[index + 1].uri)
 			} else {
 				set_status(s, fmt.tprintf("could not play %s", order[next].name), true)
 				// Skip past a track we cannot play rather than wedging.
@@ -758,9 +827,7 @@ worker_main :: proc(app: ^App) {
 			}
 		}
 
-		for url in wanted do fetch_art(s, url)
-
-		pos := player_position(&player)
+		pos := player_position(player)
 		sync.lock(&s.mutex)
 		s.progress_ms = pos.position_ms
 		s.duration_ms = pos.duration_ms
@@ -769,7 +836,10 @@ worker_main :: proc(app: ^App) {
 		sync.unlock(&s.mutex)
 
 		free_all(context.temp_allocator)
-		time.sleep(100 * time.Millisecond)
+
+		// Wake instantly when the UI queues something; otherwise tick often
+		// enough to notice a track ending.
+		sync.sema_wait_with_timeout(&s.wake, 100 * time.Millisecond)
 	}
 }
 
@@ -797,6 +867,31 @@ worker_sleep :: proc(s: ^Shared, seconds: int) -> bool {
 		time.sleep(time.Second)
 	}
 	return false
+}
+
+// Covers are fetched on their own thread. They used to be fetched inline in
+// the worker loop, which meant a screenful of new rows could hold up the next
+// playback-state publish for seconds — the play button stayed a play button
+// while the music was already going.
+@(private = "file")
+art_worker :: proc(s: ^Shared) {
+	for {
+		sync.lock(&s.mutex)
+		quit := s.quit
+		url: string
+		if len(s.art_wanted) > 0 do url = pop_front(&s.art_wanted)
+		sync.unlock(&s.mutex)
+
+		if quit do return
+		if url == "" {
+			time.sleep(30 * time.Millisecond)
+			continue
+		}
+
+		fetch_art(s, url)
+		delete(url)
+		free_all(context.temp_allocator)
+	}
 }
 
 @(private = "file")

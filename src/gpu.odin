@@ -315,7 +315,23 @@ create_swapchain :: proc(g: ^Gpu, width, height: u32) {
 	if g.extent.width == 0 do g.extent.width = 1
 	if g.extent.height == 0 do g.extent.height = 1
 
+	// Prefer mailbox: with FIFO, acquiring the next image blocks for a whole
+	// vsync interval before we get to look at input again, which is felt as
+	// lag on every click. Mailbox lets us pick up input immediately.
+	present_mode := vk.PresentModeKHR.FIFO
+	mode_count: u32
+	vk.GetPhysicalDeviceSurfacePresentModesKHR(g.phys, g.surface, &mode_count, nil)
+	modes := make([]vk.PresentModeKHR, mode_count, context.temp_allocator)
+	vk.GetPhysicalDeviceSurfacePresentModesKHR(g.phys, g.surface, &mode_count, raw_data(modes))
+	for m in modes {
+		if m == .MAILBOX {
+			present_mode = .MAILBOX
+			break
+		}
+	}
+
 	count := caps.minImageCount + 1
+	if present_mode == .MAILBOX do count = max(count, 3)
 	if caps.maxImageCount > 0 do count = min(count, caps.maxImageCount)
 
 	old := g.swapchain
@@ -331,7 +347,7 @@ create_swapchain :: proc(g: ^Gpu, width, height: u32) {
 		imageSharingMode = .EXCLUSIVE,
 		preTransform     = caps.currentTransform,
 		compositeAlpha   = {.OPAQUE},
-		presentMode      = .FIFO, // vsync; the compositor paces us
+		presentMode      = present_mode,
 		clipped          = true,
 		oldSwapchain     = old,
 	}

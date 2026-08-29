@@ -14,8 +14,11 @@ import "core:time"
 // never reconfigured between tracks.
 OUT_RATE :: 44100
 OUT_CHANNELS :: 2
-OUT_PERIOD_FRAMES :: 1024
-OUT_LATENCY_US :: 100_000
+OUT_PERIOD_FRAMES :: 256
+// How much audio sits in the device. Pausing cannot take effect any faster
+// than this drains, so keep it short — 100ms was audible as a lag on every
+// pause and every track change.
+OUT_LATENCY_US :: 24_000
 
 Audio_Out :: struct {
 	pcm:         ^snd_pcm_t,
@@ -26,6 +29,7 @@ Audio_Out :: struct {
 	playing:     bool,
 	ended:       bool, // current buffer ran out since last check
 	volume:      f32, // 0..1, applied as a square curve
+	flush:       bool, // discard what the device still holds
 	quit:        bool,
 	initialised: bool,
 }
@@ -69,6 +73,17 @@ audio_writer :: proc(out: ^Audio_Out) {
 			return
 		}
 
+		// A pause, seek or track change asks for the device buffer to be
+		// dropped. It happens here because an ALSA handle must not be touched
+		// from two threads at once.
+		if out.flush {
+			out.flush = false
+			sync.unlock(&out.mutex)
+			snd_pcm_drop(out.pcm)
+			snd_pcm_prepare(out.pcm)
+			sync.lock(&out.mutex)
+		}
+
 		frames := 0
 		gain := out.volume * out.volume // perceptually closer to linear
 		if out.playing && out.samples != nil {
@@ -93,7 +108,7 @@ audio_writer :: proc(out: ^Audio_Out) {
 
 		if frames == 0 {
 			// Paused or empty: idle rather than feeding the device silence.
-			time.sleep(20 * time.Millisecond)
+			time.sleep(15 * time.Millisecond)
 			continue
 		}
 
@@ -116,6 +131,7 @@ audio_out_set_track :: proc(out: ^Audio_Out, samples: []i16) {
 	out.cursor = 0
 	out.playing = true
 	out.ended = false
+	out.flush = true // no tail of the previous track over the new one
 	sync.unlock(&out.mutex)
 
 	delete(old)
@@ -127,18 +143,30 @@ audio_out_set_playing :: proc(out: ^Audio_Out, playing: bool) {
 }
 
 audio_out_toggle :: proc(out: ^Audio_Out) -> bool {
-	sync.guard(&out.mutex)
-	if out.samples == nil do return false
+	sync.lock(&out.mutex)
+	if out.samples == nil {
+		sync.unlock(&out.mutex)
+		return false
+	}
 	out.playing = !out.playing
-	return out.playing
+	playing := out.playing
+	// Pausing should be silent at once, not after the device drains.
+	if !playing do out.flush = true
+	sync.unlock(&out.mutex)
+	return playing
 }
 
 audio_out_seek :: proc(out: ^Audio_Out, ms: int) {
-	sync.guard(&out.mutex)
-	if out.samples == nil do return
+	sync.lock(&out.mutex)
+	if out.samples == nil {
+		sync.unlock(&out.mutex)
+		return
+	}
 	total := len(out.samples) / OUT_CHANNELS
 	out.cursor = clamp(ms * OUT_RATE / 1000, 0, total)
 	out.ended = false
+	out.flush = true // do not play on from the old position
+	sync.unlock(&out.mutex)
 }
 
 audio_out_set_volume :: proc(out: ^Audio_Out, v: f32) {

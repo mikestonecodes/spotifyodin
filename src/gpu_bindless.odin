@@ -254,8 +254,20 @@ end_one_shot :: proc(g: ^Gpu, cmd: vk.CommandBuffer) {
 		commandBufferCount = 1,
 		pCommandBuffers    = &cmd,
 	}
-	vk.QueueSubmit(g.queue, 1, &submit, 0)
-	vk.QueueWaitIdle(g.queue)
+
+	// Wait on a fence for this copy alone. QueueWaitIdle would also wait for
+	// the frame already in flight, which is gated on vsync — that turned a
+	// sub-millisecond texture upload into a 13ms stall.
+	fence: vk.Fence
+	fence_info := vk.FenceCreateInfo {
+		sType = .FENCE_CREATE_INFO,
+	}
+	vk_check(vk.CreateFence(g.device, &fence_info, nil, &fence), "CreateFence (upload)")
+
+	vk.QueueSubmit(g.queue, 1, &submit, fence)
+	vk.WaitForFences(g.device, 1, &fence, true, max(u64))
+
+	vk.DestroyFence(g.device, fence, nil)
 	vk.FreeCommandBuffers(g.device, g.cmd_pool, 1, &cmd)
 }
 

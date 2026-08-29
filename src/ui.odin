@@ -303,7 +303,8 @@ ui_begin_scroll :: proc(ui: ^UI, r: Rect, s: ^Scroll, content_height: f32) {
 	s.content = content_height
 	s.view_height = r.h
 	if ui_hovered(ui, r) {
-		s.target -= ui.scroll * 120
+		// One wheel notch arrives as ~10 units; this lands it near three rows.
+		s.target -= ui.scroll * 28
 	}
 	s.target = clamp(s.target, 0, max(content_height - r.h, 0))
 
