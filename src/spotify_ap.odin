@@ -16,6 +16,7 @@ import "core:math/big"
 import "core:net"
 import "core:strconv"
 import "core:strings"
+import "core:time"
 
 SPOTIFY_VERSION :: 124200290
 
@@ -75,6 +76,12 @@ AP_Session :: struct {
 	username:    string,
 	mercury_seq: u64,
 	key_seq:     u32,
+
+	// Spotify throttles audio key requests per session. Cache what we get,
+	// pace what we ask for, and back off when refused.
+	key_cache:   map[string][16]byte,
+	last_key:    time.Time,
+	refusals:    int,
 	connected:   bool,
 }
 
@@ -158,6 +165,8 @@ ap_close :: proc(s: ^AP_Session) {
 	if s == nil do return
 	net.close(s.socket)
 	delete(s.username)
+	for k in s.key_cache do delete(k)
+	delete(s.key_cache)
 	free(s)
 }
 
@@ -873,8 +882,38 @@ PACKET_AES_KEY_ERROR :: 0x0e
 
 // The per-file AES key. Spotify hands these out only over an authenticated
 // session, one file at a time.
-ap_audio_key :: proc(s: ^AP_Session, gid: []byte, file_id: []byte) -> (key: [16]byte, ok: bool) {
-	if len(gid) != 16 || len(file_id) != 20 do return key, false
+// Minimum spacing between key requests, and the extra wait added per refusal.
+KEY_MIN_INTERVAL :: 400 * time.Millisecond
+KEY_BACKOFF_STEP :: 400 * time.Millisecond
+KEY_BACKOFF_MAX :: 4 * time.Second
+
+// `transient` marks a refusal that is about us asking too much rather than the
+// recording being unavailable — those clear on their own, and trying the
+// track's alternatives only makes the throttling worse.
+ap_audio_key :: proc(
+	s: ^AP_Session,
+	gid: []byte,
+	file_id: []byte,
+) -> (
+	key: [16]byte,
+	ok: bool,
+	transient: bool,
+) {
+	if len(gid) != 16 || len(file_id) != 20 do return key, false, false
+
+	// Keys do not change, so a track played twice costs one request.
+	cache_key := to_hex_string(file_id, context.temp_allocator)
+	if cached, hit := s.key_cache[cache_key]; hit do return cached, true, false
+
+	// Asking too fast is what gets the whole session refused.
+	wait := KEY_MIN_INTERVAL
+	if s.refusals > 0 {
+		wait += min(KEY_BACKOFF_STEP * time.Duration(s.refusals), KEY_BACKOFF_MAX)
+	}
+	if elapsed := time.since(s.last_key); elapsed < wait {
+		time.sleep(wait - elapsed)
+	}
+	s.last_key = time.now()
 
 	seq := s.key_seq
 	s.key_seq += 1
@@ -886,23 +925,34 @@ ap_audio_key :: proc(s: ^AP_Session, gid: []byte, file_id: []byte) -> (key: [16]
 	append(&req, byte(seq >> 24), byte(seq >> 16), byte(seq >> 8), byte(seq))
 	append(&req, 0x00, 0x00)
 
-	if !ap_send(s, PACKET_REQUEST_KEY, req[:]) do return key, false
+	if !ap_send(s, PACKET_REQUEST_KEY, req[:]) do return key, false, true
 
 	for {
 		cmd, payload, recv_ok := ap_recv(s)
-		if !recv_ok do return key, false
+		if !recv_ok do return key, false, true
 
 		switch cmd {
 		case PACKET_AES_KEY:
 			defer delete(payload)
-			if len(payload) < 20 do return key, false
+			if len(payload) < 20 do return key, false, false
 			copy(key[:], payload[4:20])
-			return key, true
+			s.refusals = 0
+			s.key_cache[strings.clone(cache_key)] = key
+			return key, true, false
 		case PACKET_AES_KEY_ERROR:
 			defer delete(payload)
 			code := len(payload) >= 6 ? int(payload[4]) << 8 | int(payload[5]) : -1
-			fmt.eprintfln("Spotify refused the audio key (code %d, %s)", code, to_hex_string(payload, context.temp_allocator))
-			return key, false
+			s.refusals += 1
+			// Code 2 shows up on tracks that play fine minutes later, so treat
+			// it as "slow down" rather than "unavailable".
+			transient = code == 2
+			fmt.eprintfln(
+				"Spotify refused the audio key (code %d, refusal %d)%s",
+				code,
+				s.refusals,
+				transient ? " - backing off" : "",
+			)
+			return key, false, transient
 		case PACKET_PING:
 			ap_send(s, PACKET_PONG, payload)
 			delete(payload)

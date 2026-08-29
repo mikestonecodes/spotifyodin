@@ -24,6 +24,9 @@ Player :: struct {
 	session_token: string,
 	out:           Audio_Out,
 	ready:         bool,
+	// Guards the access-point socket: one connection, shared by the worker and
+	// the preloader.
+	ap_mutex:      sync.Mutex,
 	pre:           Preloader,
 
 	// What is playing, and the track before it. Keeping the previous buffer
@@ -35,11 +38,14 @@ Player :: struct {
 }
 
 // Decodes the next track while the current one plays, so skipping forward is a
-// buffer swap instead of a download. It gets its own access-point session: the
-// AP socket has one sequence counter per direction, so sharing it would mean
-// serialising the two, which defeats the point.
+// buffer swap instead of a download. It shares the player's single access-point
+// session: opening a second one under the same device id got every audio key
+// request refused. Only the metadata and key exchanges need the session, and
+// they are short — the download and decode, which are the slow part, run
+// outside the lock.
 Preloader :: struct {
 	session:   ^AP_Session,
+	ap_mutex:  ^sync.Mutex,
 	token:     string,
 	client:    Client,
 	mutex:     sync.Mutex,
@@ -74,14 +80,11 @@ player_init :: proc(p: ^Player, c: Client) -> bool {
 	}
 	p.ready = true
 
-	// Best effort: if the second session cannot be established we still play,
-	// just without the head start.
 	p.pre.client = c
 	p.pre.token = strings.clone(session_token)
-	if pre_session, pre_ok := ap_connect(session_token, device_id()); pre_ok {
-		p.pre.session = pre_session
-		p.pre.worker = thread.create_and_start_with_poly_data(&p.pre, preload_worker)
-	}
+	p.pre.session = session
+	p.pre.ap_mutex = &p.ap_mutex
+	p.pre.worker = thread.create_and_start_with_poly_data(&p.pre, preload_worker)
 	return true
 }
 
@@ -112,7 +115,7 @@ preload_worker :: proc(pre: ^Preloader) {
 			continue
 		}
 
-		audio, ok := load_track_audio(pre.session, pre.token, uri)
+		audio, ok := load_track_audio(pre.session, pre.ap_mutex, pre.token, uri)
 
 		sync.lock(&pre.mutex)
 		if ok && pre.want == uri {
@@ -141,7 +144,6 @@ player_destroy :: proc(p: ^Player) {
 	p.pre.quit = true
 	sync.unlock(&p.pre.mutex)
 	if p.pre.worker != nil do thread.join(p.pre.worker)
-	if p.pre.session != nil do ap_close(p.pre.session)
 	delete(p.pre.samples)
 	delete(p.pre.want)
 	delete(p.pre.ready_uri)
@@ -183,7 +185,7 @@ player_load :: proc(p: ^Player, uri: string) -> bool {
 
 	// Nothing ready: fetch and decode, which takes a few seconds.
 	if samples == nil {
-		audio, ok := load_track_audio(p.session, p.session_token, uri)
+		audio, ok := load_track_audio(p.session, &p.ap_mutex, p.session_token, uri)
 		if !ok do return false
 		samples = audio.samples
 	}
@@ -204,6 +206,7 @@ player_load :: proc(p: ^Player, uri: string) -> bool {
 // not hand over a key for the original recording.
 load_track_audio :: proc(
 	session: ^AP_Session,
+	ap_mutex: ^sync.Mutex,
 	token: string,
 	uri: string,
 ) -> (
@@ -214,7 +217,9 @@ load_track_audio :: proc(
 	if !gid_ok do return {}, false
 	defer delete(gid)
 
+	sync.lock(ap_mutex)
 	files, files_ok := ap_track_files(session, gid)
+	sync.unlock(ap_mutex)
 	if !files_ok || len(files) == 0 do return {}, false
 	defer {
 		for f in files {
@@ -224,49 +229,67 @@ load_track_audio :: proc(
 		delete(files)
 	}
 
+	// One ordered candidate list rather than a sweep of every format across
+	// every alternative: each attempt costs an audio key request, and asking
+	// for too many in a row gets the whole session throttled.
+	candidates: [dynamic]Audio_File
+	defer delete(candidates)
 	for want in ([3]int{2, 1, 0}) { // 320, 160, 96 kbps
 		for f in files {
-			if f.format != want do continue
-
-			t0 := time.now()
-			key, key_ok := ap_audio_key(session, f.gid, f.file_id)
-			if !key_ok do continue
-
-			url, url_ok := resolve_audio_url(token, f.file_id)
-			if !url_ok do continue
-			defer delete(url)
-
-			t1 := time.now()
-			encrypted, dl_ok := download_audio_file(url)
-			if !dl_ok do continue
-			defer delete(encrypted)
-
-			t2 := time.now()
-			ogg := decrypt_audio_file(encrypted, key)
-			decoded, decode_ok := decode_ogg(ogg)
-			if !decode_ok do continue
-			if track_load_profile {
-				fmt.eprintfln(
-					"load: key+resolve %.0fms  download %.0fms (%dKB)  decrypt+decode %.0fms",
-					time.duration_milliseconds(time.diff(t0, t1)),
-					time.duration_milliseconds(time.diff(t1, t2)),
-					len(encrypted) / 1024,
-					time.duration_milliseconds(time.since(t2)),
-				)
-			}
-
-			if decoded.channels != OUT_CHANNELS || decoded.sample_rate != OUT_RATE {
-				fmt.eprintfln(
-					"unexpected audio format: %d Hz, %d channels",
-					decoded.sample_rate,
-					decoded.channels,
-				)
-				delete(decoded.samples)
-				continue
-			}
-			return decoded, true
+			if f.format == want do append(&candidates, f)
 		}
 	}
+
+	MAX_ATTEMPTS :: 3
+	for f, attempt in candidates {
+		if attempt >= MAX_ATTEMPTS do break
+
+		t0 := time.now()
+		sync.lock(ap_mutex)
+		key, key_ok, transient := ap_audio_key(session, f.gid, f.file_id)
+		sync.unlock(ap_mutex)
+		if !key_ok {
+			// Being throttled is not this recording's fault: stop rather than
+			// burning more requests on its alternatives.
+			if transient do break
+			continue
+		}
+
+		url, url_ok := resolve_audio_url(token, f.file_id)
+		if !url_ok do continue
+		defer delete(url)
+
+		t1 := time.now()
+		encrypted, dl_ok := download_audio_file(url)
+		if !dl_ok do continue
+		defer delete(encrypted)
+
+		t2 := time.now()
+		ogg := decrypt_audio_file(encrypted, key)
+		decoded, decode_ok := decode_ogg(ogg)
+		if !decode_ok do continue
+		if track_load_profile {
+			fmt.eprintfln(
+				"load: key+resolve %.0fms  download %.0fms (%dKB)  decrypt+decode %.0fms",
+				time.duration_milliseconds(time.diff(t0, t1)),
+				time.duration_milliseconds(time.diff(t1, t2)),
+				len(encrypted) / 1024,
+				time.duration_milliseconds(time.since(t2)),
+			)
+		}
+
+		if decoded.channels != OUT_CHANNELS || decoded.sample_rate != OUT_RATE {
+			fmt.eprintfln(
+				"unexpected audio format: %d Hz, %d channels",
+				decoded.sample_rate,
+				decoded.channels,
+			)
+			delete(decoded.samples)
+			continue
+		}
+		return decoded, true
+	}
+
 	return {}, false
 }
 

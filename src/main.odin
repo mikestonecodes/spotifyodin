@@ -198,7 +198,7 @@ cmd_fetch :: proc(c: Client, opt: Options) {
 	}
 	fmt.printfln("file: %s (%s)", to_hex_string(best.file_id, context.temp_allocator), audio_format_name(best.format))
 
-	key, key_ok := ap_audio_key(session, best.gid, best.file_id)
+	key, key_ok, _ := ap_audio_key(session, best.gid, best.file_id)
 	if !key_ok do os.exit(1)
 
 	url, url_ok := resolve_audio_url(session_token, best.file_id)
@@ -292,7 +292,7 @@ cmd_ap_login :: proc(c: Client) {
 		return
 	}
 
-	key, key_ok := ap_audio_key(session, gid, best.file_id)
+	key, key_ok, _ := ap_audio_key(session, gid, best.file_id)
 	if !key_ok {
 		fmt.println("  could not get an audio key")
 		return
@@ -318,7 +318,7 @@ cmd_ap_login :: proc(c: Client) {
 				else if pick.file_id == nil && (f.format == 1 || f.format == 0) do pick = f
 			}
 			if pick.file_id != nil {
-				_, ok2 := ap_audio_key(session, g, pick.file_id)
+				_, ok2, _ := ap_audio_key(session, g, pick.file_id)
 				fmt.printfln("  %-28s key %s", t.name, ok2 ? "OK" : "REFUSED")
 			}
 			for f in fs {

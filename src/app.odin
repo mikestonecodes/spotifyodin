@@ -928,10 +928,12 @@ worker_main :: proc(app: ^App) {
 				if index + 1 < len(order) do player_preload(player, order[index + 1].uri)
 			} else {
 				set_status(s, fmt.tprintf("could not play %s", order[next].name), true)
-				// Skip past a track we cannot play rather than wedging.
+				// Skip past a track we cannot play, but slowly: the usual
+				// cause is Spotify throttling key requests, and racing ahead
+				// just asks for more of them.
 				index = next
 				load_index = next + 1
-				if worker_sleep(s, 1) do return
+				if worker_sleep(s, 2) do return
 			}
 		}
 
