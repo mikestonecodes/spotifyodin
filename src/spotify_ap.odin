@@ -952,17 +952,11 @@ ap_audio_key :: proc(
 			// the whole queue for one bad song.
 			if code == 2 do s.refusals += 1
 			// Code 2 shows up on tracks that play fine moments later, so treat
-			// it as "slow down" rather than "unavailable". The caller retries,
-			// and each retry waits longer, so this is only worth reporting
-			// once it has become persistent.
+			// it as "slow down" rather than "unavailable". Neither case is
+			// reported here: the caller retries transient refusals and falls
+			// through to alternative recordings on hard ones, so a refusal is
+			// only news if the track ends up unplayable.
 			transient = code == 2
-			if !transient || s.refusals % 8 == 0 {
-				fmt.eprintfln(
-					"Spotify refused the audio key (code %d, %d in a row)",
-					code,
-					s.refusals,
-				)
-			}
 			return key, false, transient
 		case PACKET_PING:
 			ap_send(s, PACKET_PONG, payload)

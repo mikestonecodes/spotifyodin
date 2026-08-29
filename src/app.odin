@@ -951,8 +951,10 @@ worker_main :: proc(app: ^App) {
 					unplayable[strings.clone(order[next].uri)] = true
 					save_unplayable(unplayable)
 					set_status(s, fmt.tprintf("%s is not available here", order[next].name), true)
+					fmt.eprintfln("not available here: %s - %s", order[next].artist, order[next].name)
 				} else {
 					set_status(s, fmt.tprintf("could not play %s", order[next].name), true)
+					fmt.eprintfln("could not play %s - %s", order[next].artist, order[next].name)
 				}
 
 				// Skip past it, but slowly: a non-permanent failure is usually
