@@ -39,10 +39,17 @@ Command :: enum {
 }
 
 Art :: struct {
-	url:    string,
-	pixels: []byte,
-	width:  int,
-	height: int,
+	url:     string,
+	pixels:  []byte,
+	width:   int,
+	height:  int,
+	feature: bool, // goes to the dedicated full-size slot
+}
+
+Art_Request :: struct {
+	url:     string,
+	max_px:  int,
+	feature: bool,
 }
 
 // Everything the worker thread and the UI thread share. The UI never makes a
@@ -72,7 +79,7 @@ Shared :: struct {
 	play_index:   int, // >= 0 means "start the queue here"
 	seek_ms:      int, // >= 0 means "seek the current track here"
 
-	art_wanted:   [dynamic]string,
+	art_wanted:   [dynamic]Art_Request,
 	art_ready:    [dynamic]Art,
 	art_inflight: map[string]bool,
 }
@@ -105,6 +112,9 @@ App :: struct {
 	flip_dir:     f32,
 	prev_art:     string,
 	now_art_url:  string,
+	feature_url:  string, // what the dedicated full-size slot currently holds
+	feature_slot: u32,
+	feature_ready: bool,
 	last_index:   int,
 
 	// Owned by the worker, but the UI thread calls the audio-only operations
@@ -558,8 +568,10 @@ draw_feature :: proc(app: ^App, r: Rect, name, artist: string, progress, duratio
 	cover := rect_inset(r, -r.w * pop / 2, -r.w * pop / 2)
 
 	ui_rect(ui, cover, PANEL_HI, radius)
-	if slot, has := current_art_slot(app); has {
-		ui_image(ui, cover, slot, radius)
+	if app.feature_ready {
+		ui_image(ui, cover, app.feature_slot, radius)
+	} else if slot, has := current_art_slot(app); has {
+		ui_image(ui, cover, slot, radius) // the small one until the big arrives
 	}
 	if app.pulse > 0.01 {
 		ui_rect(ui, cover, rgba(255, 255, 255, u8(40 * app.pulse)), radius)
@@ -596,14 +608,20 @@ track_change_pulse :: proc(app: ^App, now_uri: string) {
 		// Remember where it sits so the grid can leave it out — it is already
 		// on screen as the feature tile.
 		app.now_index = -1
+		big: string
 		sync.lock(&app.shared.mutex)
 		for t, i in app.shared.tracks {
 			if t.uri == now_uri {
 				app.now_index = i
+				big = strings.clone(
+					big_art_url(t.art_url_big, t.art_url),
+					context.temp_allocator,
+				)
 				break
 			}
 		}
 		sync.unlock(&app.shared.mutex)
+		want_feature_art(app, big)
 	}
 	if app.pulse > 0 {
 		app.pulse = max(app.pulse - ui.dt * 2.2, 0)
@@ -801,7 +819,40 @@ want_art :: proc(app: ^App, url: string) {
 	sync.guard(&app.shared.mutex)
 	if app.shared.art_inflight[url] do return
 	app.shared.art_inflight[url] = true
-	append(&app.shared.art_wanted, strings.clone(url))
+	append(&app.shared.art_wanted, Art_Request{strings.clone(url), ART_TEXTURE_PX, false})
+}
+
+// Spotify's image URLs encode the size in a fixed prefix, so the full-size
+// cover can be derived from the one we already cached. That avoids refetching
+// the whole library just to learn a second URL for each track.
+@(private = "file")
+ART_PREFIX_300 :: "ab67616d00001e02"
+@(private = "file")
+ART_PREFIX_640 :: "ab67616d0000b273"
+
+@(private = "file")
+big_art_url :: proc(track_big, track_small: string) -> string {
+	if track_big != "" do return track_big
+	if i := strings.index(track_small, ART_PREFIX_300); i >= 0 {
+		return fmt.tprintf(
+			"%s%s%s",
+			track_small[:i],
+			ART_PREFIX_640,
+			track_small[i + len(ART_PREFIX_300):],
+		)
+	}
+	return track_small
+}
+
+// The playing cover, at full size, into the slot reserved for it.
+@(private = "file")
+want_feature_art :: proc(app: ^App, url: string) {
+	if url == "" || url == app.feature_url do return
+	delete(app.feature_url)
+	app.feature_url = strings.clone(url)
+
+	sync.guard(&app.shared.mutex)
+	append(&app.shared.art_wanted, Art_Request{strings.clone(url), ART_FEATURE_PX, true})
 }
 
 // Each upload waits on the queue, so a scroll that queues fifty covers would
@@ -811,6 +862,11 @@ ART_UPLOADS_PER_FRAME :: 4
 // Covers are stored at this size. A tile is ~170-200 logical pixels, so this
 // is sharp, and it keeps a full bindless table down to a sane amount of VRAM.
 ART_TEXTURE_PX :: 224
+
+// The feature cover is drawn several hundred pixels across, so it gets its own
+// slot at full size, replaced in place each track rather than adding an entry
+// per song.
+ART_FEATURE_PX :: 640
 
 @(private = "file")
 upload_pending_art :: proc(app: ^App) -> (uploaded: bool) {
@@ -826,7 +882,18 @@ upload_pending_art :: proc(app: ^App) -> (uploaded: bool) {
 
 	// Uploading touches the GPU queue, so it happens here on the render thread.
 	for a in ready[:count] {
-		app.art[a.url] = texture_upload(&app.gpu, a.pixels, a.width, a.height, 4)
+		if a.feature {
+			// One slot, reused: allocate it the first time, overwrite after.
+			if !app.feature_ready {
+				app.feature_slot = texture_upload(&app.gpu, a.pixels, a.width, a.height, 4)
+				app.feature_ready = true
+			} else {
+				texture_replace(&app.gpu, app.feature_slot, a.pixels, a.width, a.height, 4)
+			}
+			delete(a.url)
+		} else {
+			app.art[a.url] = texture_upload(&app.gpu, a.pixels, a.width, a.height, 4)
+		}
 		delete(a.pixels)
 	}
 	return count > 0
@@ -861,24 +928,37 @@ toggle_playback :: proc(app: ^App) {
 // one request instead of eighty.
 @(private = "file")
 load_or_fetch_library :: proc(c: Client, s: ^Shared) -> ([dynamic]Track, bool) {
-	tracks, complete, hit := load_library()
+	tracks, fresh, hit := load_library()
 
-	if hit && complete {
-		set_status(s, fmt.tprintf("%d songs (cached)", len(tracks)))
-		total, known := get_liked_total(c)
-		if !known || total == len(tracks) do return tracks, true
-
-		set_status(s, "library changed, reloading...")
+	// A cache saved in the last day is taken as current, so a normal start
+	// makes no network call at all.
+	if hit && fresh {
+		set_status(s, fmt.tprintf("%d songs", len(tracks)))
+		return tracks, true
+	}
+	if hit {
 		for t in tracks do free_track(t)
 		clear(&tracks)
-	} else if hit {
-		set_status(s, fmt.tprintf("resuming from %d songs...", len(tracks)))
-	} else {
-		set_status(s, "loading liked songs...")
 	}
 
+	set_status(s, "loading liked songs...")
+
+	// Prefer spclient. The Web API's /me/tracks is rate limited per user and
+	// hands out multi-hour lockouts, which leaves the app with nothing; the
+	// access point's own services have a separate budget.
+	if session_token, have := get_access_token(.Session); have {
+		defer delete(session_token)
+		spc_tracks, spc_ok := fetch_library_spclient(session_token, on_load_progress, s)
+		if spc_ok {
+			delete(tracks)
+			save_library(spc_tracks[:], true)
+			return spc_tracks, true
+		}
+		delete(spc_tracks)
+	}
+
+	// Fall back to the Web API if spclient would not answer.
 	done := get_liked_tracks(c, &tracks, on_load_progress, s)
-	// Save either way: a partial library is a head start, not a failure.
 	save_library(tracks[:], done)
 	return tracks, done
 }
@@ -905,8 +985,19 @@ worker_main :: proc(app: ^App) {
 		tracks, loaded = load_or_fetch_library(c, s)
 		if loaded do break
 
+		// Say how long the limit actually is. Spotify hands out multi-hour
+		// ones, and "loading..." for three hours looks like a hang.
 		wait := min(30 << uint(min(attempt, 3)), 240)
-		set_status(s, fmt.tprintf("Spotify is rate limiting; retrying in %ds", wait), true)
+		if g_rate_limit_wait > 300 {
+			set_status(
+				s,
+				fmt.tprintf("Spotify rate limit - about %dh left", (g_rate_limit_wait + 1800) / 3600),
+				true,
+			)
+			wait = min(g_rate_limit_wait, 900)
+		} else {
+			set_status(s, fmt.tprintf("Spotify is rate limiting; retrying in %ds", wait), true)
+		}
 		if worker_sleep(s, wait) do return
 	}
 
@@ -1107,24 +1198,25 @@ art_worker :: proc(s: ^Shared) {
 	for {
 		sync.lock(&s.mutex)
 		quit := s.quit
-		url: string
-		if len(s.art_wanted) > 0 do url = pop_front(&s.art_wanted)
+		req: Art_Request
+		if len(s.art_wanted) > 0 do req = pop_front(&s.art_wanted)
 		sync.unlock(&s.mutex)
 
 		if quit do return
-		if url == "" {
+		if req.url == "" {
 			time.sleep(30 * time.Millisecond)
 			continue
 		}
 
-		fetch_art(s, url)
-		delete(url)
+		fetch_art(s, req)
+		delete(req.url)
 		free_all(context.temp_allocator)
 	}
 }
 
 @(private = "file")
-fetch_art :: proc(s: ^Shared, url: string) {
+fetch_art :: proc(s: ^Shared, req: Art_Request) {
+	url := req.url
 	res, ok := http_request("GET", url, nil)
 	if !ok || res.status != 200 {
 		delete(res.body)
@@ -1141,8 +1233,8 @@ fetch_art :: proc(s: ^Shared, url: string) {
 	// Downscaling here keeps the whole table affordable.
 	out_w, out_h := int(w), int(h)
 	data := pixels[:out_w * out_h * 4]
-	if max(out_w, out_h) > ART_TEXTURE_PX {
-		scale := f32(ART_TEXTURE_PX) / f32(max(out_w, out_h))
+	if max(out_w, out_h) > req.max_px {
+		scale := f32(req.max_px) / f32(max(out_w, out_h))
 		nw := max(int(f32(out_w) * scale), 1)
 		nh := max(int(f32(out_h) * scale), 1)
 		small := make([]byte, nw * nh * 4)
@@ -1171,7 +1263,13 @@ fetch_art :: proc(s: ^Shared, url: string) {
 	sync.guard(&s.mutex)
 	append(
 		&s.art_ready,
-		Art{url = strings.clone(url), pixels = data, width = out_w, height = out_h},
+		Art {
+			url = strings.clone(url),
+			pixels = data,
+			width = out_w,
+			height = out_h,
+			feature = req.feature,
+		},
 	)
 }
 

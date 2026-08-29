@@ -9,6 +9,11 @@ import curl "vendor:curl"
 
 g_ctx: runtime.Context
 
+// The longest Retry-After the server has asked for recently, in seconds. A
+// rate limit can be hours long, and a UI that only says "loading" while it
+// waits one out is indistinguishable from a hang.
+g_rate_limit_wait: int
+
 Response :: struct {
 	status:      int,
 	body:        string,
@@ -44,10 +49,12 @@ http_request :: proc(
 		res, ok = http_once(method, url, headers, body)
 		if !ok do return
 
+		if res.status == 429 do g_rate_limit_wait = max(res.retry_after, 1)
 		retryable := res.status == 429 || res.status >= 500
 		if retryable && attempt < retries - 1 {
 			// Drop the body and blank it: the caller owns whatever we finally
 			// return, and handing back a freed slice is a double free.
+			if res.status == 429 do g_rate_limit_wait = max(res.retry_after, 1)
 			wait := res.retry_after > 0 ? res.retry_after : 2 + attempt * 3
 			if res.status == 429 {
 				fmt.eprintfln("Spotify rate limit; waiting %ds", min(wait, 60))

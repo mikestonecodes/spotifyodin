@@ -5,16 +5,18 @@ import "core:fmt"
 import "core:crypto"
 import "core:encoding/hex"
 import "core:os"
+import "core:time"
 import "core:strings"
 
 // The library rarely changes but always costs ~80 requests to read, so it goes
 // to disk. On the next run one cheap request confirms the count still matches
 // before the cache is trusted.
-CACHE_VERSION :: 2 // bumped when art_url moved from 64px to 300px
+CACHE_VERSION :: 2
 
 Cached_Library :: struct {
 	version:  int,
-	complete: bool, // false while a rate-limited fetch is still catching up
+	complete: bool, // false while an interrupted fetch is still catching up
+	saved_at: i64, // unix seconds, so a fresh cache can skip revalidation
 	tracks:   []Track,
 }
 
@@ -34,7 +36,12 @@ save_library :: proc(tracks: []Track, complete := true) {
 	if len(tracks) == 0 do return
 	os.make_directory_all(cache_dir())
 	data, err := json.marshal(
-		Cached_Library{version = CACHE_VERSION, complete = complete, tracks = tracks},
+		Cached_Library {
+			version = CACHE_VERSION,
+			complete = complete,
+			saved_at = time.now()._nsec / 1e9,
+			tracks = tracks,
+		},
 	)
 	if err != nil do return
 	defer delete(data)
@@ -42,6 +49,7 @@ save_library :: proc(tracks: []Track, complete := true) {
 }
 
 load_library :: proc() -> (tracks: [dynamic]Track, complete: bool, ok: bool) {
+	_, _, _ = tracks, complete, ok
 	data, err := os.read_entire_file_from_path(library_cache_path(), context.allocator)
 	if err != nil do return tracks, false, false
 	defer delete(data)
@@ -52,7 +60,15 @@ load_library :: proc() -> (tracks: [dynamic]Track, complete: bool, ok: bool) {
 
 	append(&tracks, ..cached.tracks)
 	delete(cached.tracks)
-	return tracks, cached.complete, true
+
+	// Treat a recent cache as current: revalidating on every start costs a
+	// request for something that changes a few times a week at most. A cache
+	// with no timestamp counts as current too — an unknown age is not a reason
+	// to refetch several thousand tracks.
+	FRESH_FOR :: 24 * 60 * 60
+	age := time.now()._nsec / 1e9 - cached.saved_at
+	fresh := cached.saved_at == 0 || age < FRESH_FOR
+	return tracks, cached.complete && fresh, true
 }
 
 // A stable per-install device id, as the access point expects. librespot uses
@@ -142,6 +158,26 @@ save_unplayable :: proc(set: map[string]bool) {
 	if err != nil do return
 	defer delete(data)
 	_ = os.write_entire_file(unplayable_path(), data)
+}
+
+// The account name, learned from the access point at login. Kept because the
+// spclient collection uri needs it and asking api.spotify.com for it would
+// walk straight back into the rate limit we are avoiding.
+username_path :: proc() -> string {
+	return fmt.aprintf("%s/username", cache_dir())
+}
+
+save_username :: proc(name: string) {
+	if name == "" do return
+	os.make_directory_all(cache_dir())
+	_ = os.write_entire_file(username_path(), transmute([]byte)name)
+}
+
+load_username :: proc() -> string {
+	data, err := os.read_entire_file_from_path(username_path(), context.allocator)
+	if err != nil do return ""
+	defer delete(data)
+	return strings.clone(strings.trim_space(string(data)))
 }
 
 forget_library :: proc() {

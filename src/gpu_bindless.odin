@@ -106,8 +106,36 @@ bindless_init :: proc(g: ^Gpu) {
 // Uploads pixels and returns the slot the shader should index. `channels` is
 // 1 (coverage, drawn as alpha) or 4 (RGBA).
 texture_upload :: proc(g: ^Gpu, pixels: []byte, width, height, channels: int) -> u32 {
-	assert(channels == 1 || channels == 4)
 	if len(g.textures) >= BINDLESS_CAPACITY do return WHITE_TEX
+
+	slot := u32(len(g.textures))
+	append(&g.textures, make_texture(g, pixels, width, height, channels))
+	write_texture_descriptor(g, slot)
+	return slot
+}
+
+@(private = "file")
+write_texture_descriptor :: proc(g: ^Gpu, slot: u32) {
+	desc_image := vk.DescriptorImageInfo {
+		sampler     = g.sampler,
+		imageView   = g.textures[slot].view,
+		imageLayout = .SHADER_READ_ONLY_OPTIMAL,
+	}
+	write := vk.WriteDescriptorSet {
+		sType           = .WRITE_DESCRIPTOR_SET,
+		dstSet          = g.desc_set,
+		dstBinding      = 0,
+		dstArrayElement = slot,
+		descriptorCount = 1,
+		descriptorType  = .COMBINED_IMAGE_SAMPLER,
+		pImageInfo      = &desc_image,
+	}
+	vk.UpdateDescriptorSets(g.device, 1, &write, 0, nil)
+}
+
+@(private = "file")
+make_texture :: proc(g: ^Gpu, pixels: []byte, width, height, channels: int) -> Texture {
+	assert(channels == 1 || channels == 4)
 
 	format: vk.Format = channels == 4 ? .R8G8B8A8_UNORM : .R8_UNORM
 	tex := Texture {
@@ -176,25 +204,25 @@ texture_upload :: proc(g: ^Gpu, pixels: []byte, width, height, channels: int) ->
 	}
 	vk_check(vk.CreateImageView(g.device, &view_info, nil, &tex.view), "CreateImageView")
 
-	slot := u32(len(g.textures))
-	append(&g.textures, tex)
+	return tex
+}
 
-	desc_image := vk.DescriptorImageInfo {
-		sampler     = g.sampler,
-		imageView   = tex.view,
-		imageLayout = .SHADER_READ_ONLY_OPTIMAL,
-	}
-	write := vk.WriteDescriptorSet {
-		sType           = .WRITE_DESCRIPTOR_SET,
-		dstSet          = g.desc_set,
-		dstBinding      = 0,
-		dstArrayElement = slot,
-		descriptorCount = 1,
-		descriptorType  = .COMBINED_IMAGE_SAMPLER,
-		pImageInfo      = &desc_image,
-	}
-	vk.UpdateDescriptorSets(g.device, 1, &write, 0, nil)
-	return slot
+// Swaps new pixels into an existing slot, so a texture that is replaced often —
+// the feature cover, at full size — costs one entry rather than one per track.
+texture_replace :: proc(g: ^Gpu, slot: u32, pixels: []byte, width, height, channels: int) {
+	if int(slot) >= len(g.textures) do return
+
+	// The old image may still be referenced by a frame in flight. Replacing it
+	// happens once per track, so waiting is cheaper than tracking lifetimes.
+	vk.DeviceWaitIdle(g.device)
+
+	old := g.textures[slot]
+	vk.DestroyImageView(g.device, old.view, nil)
+	vk.DestroyImage(g.device, old.image, nil)
+	vk.FreeMemory(g.device, old.memory, nil)
+
+	g.textures[slot] = make_texture(g, pixels, width, height, channels)
+	write_texture_descriptor(g, slot)
 }
 
 @(private = "file")

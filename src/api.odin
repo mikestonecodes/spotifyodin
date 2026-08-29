@@ -11,7 +11,8 @@ Track :: struct {
 	name:      string,
 	artist:    string,
 	artist_id: string,
-	art_url:   string,
+	art_url:     string, // ~300px, for grid tiles
+	art_url_big: string, // largest available, for the feature tile
 }
 
 Device :: struct {
@@ -136,7 +137,9 @@ fetch_page :: proc(
 		// is still at least ART_MIN_PX: the 64px one is a blurry mess on
 		// anything bigger than a list thumbnail.
 		art_url: string
+		art_url_big: string
 		best_width := 0
+		big_width := 0
 		for img in jarr(jpath(t, "album"), "images") {
 			url := jstr(img, "url")
 			if url == "" do continue
@@ -149,6 +152,13 @@ fetch_page :: proc(
 				art_url = url
 				best_width = w
 			}
+
+			// The feature tile is drawn several hundred pixels across, so it
+			// needs the biggest one on offer or it looks upscaled.
+			if w > big_width {
+				art_url_big = url
+				big_width = w
+			}
 		}
 
 		append(
@@ -159,6 +169,7 @@ fetch_page :: proc(
 				artist = strings.clone(artist),
 				artist_id = strings.clone(artist_id),
 				art_url = strings.clone(art_url),
+				art_url_big = strings.clone(art_url_big),
 			},
 		)
 	}
@@ -166,6 +177,7 @@ fetch_page :: proc(
 }
 
 free_track :: proc(t: Track) {
+	delete(t.art_url_big)
 	delete(t.uri)
 	delete(t.name)
 	delete(t.artist)

@@ -419,6 +419,7 @@ ap_login :: proc(s: ^AP_Session, access_token: string, device_id: string) -> boo
 		case PACKET_AP_WELCOME:
 			if name, found := pb_find(payload, 10); found {
 				s.username = strings.clone(string(name))
+				save_username(s.username)
 			}
 			return true
 		case PACKET_AUTH_FAILURE:
