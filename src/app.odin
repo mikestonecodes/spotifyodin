@@ -388,11 +388,7 @@ draw_queue :: proc(app: ^App, r: Rect, now_uri: string) {
 			ui_rect(ui, card, rgba(255, 255, 255, u8(14 * lift)), 14)
 		}
 
-        num := fmt.tprintf("%d", i + 1)
-		nw := font_width(&ui.regular, num, 15)
-		ui_text(ui, &ui.regular, num, {card.x + 52 - nw, row.y + ROW_H / 2 - 10}, 15, is_now ? ACCENT : DIM)
-
-		art := Rect{card.x + 68, row.y + (ROW_H - ART) / 2, ART, ART}
+		art := Rect{card.x + 22, row.y + (ROW_H - ART) / 2, ART, ART}
 		if slot, has := app.art[track.art_url]; has {
 			ui_image(ui, art, slot, 8)
 		} else {
@@ -400,7 +396,7 @@ draw_queue :: proc(app: ^App, r: Rect, now_uri: string) {
 			want_art(app, track.art_url)
 		}
 
-		text_x := art.x + ART + 20
+		text_x := art.x + ART + 22
 		text_w := row.w - text_x - 40
 		title := font_ellipsize(&ui.bold, track.name, 20, text_w)
 		artist := font_ellipsize(&ui.regular, track.artist, 15, text_w)
