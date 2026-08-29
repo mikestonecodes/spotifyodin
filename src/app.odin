@@ -2,6 +2,8 @@ package spoticyclint
 
 import "core:fmt"
 import "core:os"
+import "core:math"
+import "core:math/linalg"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -104,6 +106,15 @@ App :: struct {
 	last_now_uri: string,
 	pulse:        f32, // 1 -> 0 right after a change
 	now_index:    int, // where the playing track sits in the queue, or -1
+
+	// A track change flies its cover out of the grid and into the feature
+	// tile, and sends a ripple through the tiles it left behind.
+	fly:          f32, // 1 -> 0 over the transition
+	fly_from:     Rect,
+	fly_slot:     u32,
+	fly_has_art:  bool,
+	wave:         f32, // 1 -> 0, the ripple
+	wave_origin:  [2]f32,
 
 	// The big cover turns over when the track changes: `flip` runs 1 -> 0 and
 	// `flip_dir` decides which way, while `prev_art` is what it turns away
@@ -466,7 +477,12 @@ draw_queue :: proc(
 	count := len(s.tracks)
 	sync.unlock(&s.mutex)
 
-	track_change_pulse(app, now_uri)
+	// The layout as it stood before this frame's change: the cover that is
+	// about to become the feature was sitting somewhere in it, and that is
+	// where its flight starts.
+	was_skipping := app.now_index >= 0 && app.now_index < count
+	previous_grid := grid_for(r.w, was_skipping ? count - 1 : count)
+	track_change_pulse(app, now_uri, previous_grid, r)
 
 	// The playing track is the feature tile, so the grid holds everything else.
 	skip := app.now_index >= 0 && app.now_index < count
@@ -520,6 +536,26 @@ draw_queue :: proc(
 		draw_tile(app, cell, track, i, false)
 	}
 
+	// Drawn last so it passes over the tiles on its way to the corner.
+	if app.fly > 0.001 && app.fly_has_art {
+		t := 1 - app.fly
+		e := 1 - (1 - t) * (1 - t) * (1 - t) // ease out, so it lands softly
+		from := app.fly_from
+		box := Rect {
+			from.x + (feature.x - from.x) * e,
+			from.y + (feature.y - from.y) * e,
+			from.w + (feature.w - from.w) * e,
+			from.h + (feature.h - from.h) * e,
+		}
+		ui_glow(
+			ui,
+			{box.x + box.w / 2, box.y + box.h / 2},
+			box.w * 0.8,
+			color_alpha(ACCENT, 0.35 * app.fly),
+		)
+		ui_image_wobble(ui, box, app.fly_slot, app.fly * 0.030, box.w * 0.05)
+	}
+
 	ui_end_scroll(ui, r, &app.scroll, DIM)
 }
 
@@ -533,7 +569,20 @@ draw_tile :: proc(app: ^App, cell: Rect, track: Track, i: int, is_now: bool) {
 	lift := ui_anim(ui, id, hovered ? 1 : 0, 16)
 	glow := ui_anim(ui, id ~ 1, is_now ? 1 : 0, 10)
 	press := ui_anim(ui, id ~ 2, ui.active == id ? 1 : 0, 26)
-	scale := 1 + lift * 0.06 - press * 0.05
+
+	// A ring travelling out from wherever the last track came from, so a skip
+	// visibly moves through the grid rather than only changing one tile.
+	wave: f32
+	if app.wave > 0 {
+		centre := [2]f32{cell.x + cell.w / 2, cell.y + cell.h / 2}
+		d := linalg.length(centre - app.wave_origin)
+		phase := (1 - app.wave) * 1900 - d // front travels ~1900px/sec
+		if phase > 0 && phase < 240 {
+			wave = math.sin(phase / 240 * math.PI)
+		}
+	}
+
+	scale := 1 + lift * 0.06 - press * 0.05 + wave * 0.07
 
 	grow := cell.w * (scale - 1) / 2
 	cover := rect_inset(cell, -grow, -grow)
@@ -549,10 +598,14 @@ draw_tile :: proc(app: ^App, cell: Rect, track: Track, i: int, is_now: bool) {
 	fade := ui_anim(ui, id ~ 3, has_art ? 1 : 0, 8)
 	ui_rect(ui, cover, PANEL_HI, radius)
 	if has_art && fade > 0.01 {
-		ui_image(ui, cover, slot, radius, rgba(255, 255, 255, u8(255 * fade)))
+		tint := rgba(255, 255, 255, u8(255 * fade))
+		ui_image_wobble(ui, cover, slot, wave * 0.016, radius, tint)
 	}
 	if lift > 0.01 {
 		ui_rect(ui, cover, rgba(255, 255, 255, u8(22 * lift)), radius)
+	}
+	if wave > 0.01 {
+		ui_rect(ui, cover, color_alpha(ACCENT, wave * 0.30), radius)
 	}
 }
 
@@ -568,37 +621,60 @@ draw_feature :: proc(app: ^App, r: Rect, name, artist: string, progress, duratio
 	cover := rect_inset(r, -r.w * pop / 2, -r.w * pop / 2)
 
 	ui_rect(ui, cover, PANEL_HI, radius)
+	settle := app.pulse * 0.018
 	if app.feature_ready {
-		ui_image(ui, cover, app.feature_slot, radius)
+		ui_image_wobble(ui, cover, app.feature_slot, settle, radius)
 	} else if slot, has := current_art_slot(app); has {
-		ui_image(ui, cover, slot, radius) // the small one until the big arrives
+		// The small cover stands in until the full-size one arrives.
+		ui_image_wobble(ui, cover, slot, settle, radius)
 	}
 	if app.pulse > 0.01 {
 		ui_rect(ui, cover, rgba(255, 255, 255, u8(40 * app.pulse)), radius)
 	}
 
 	if name != "" {
-		scrim := Rect{cover.x, cover.y + cover.h * 0.52, cover.w, cover.h * 0.48}
+		scrim := Rect{cover.x, cover.y + cover.h * 0.45, cover.w, cover.h * 0.55}
 		ui_gradient_v(ui, scrim, rgba(0, 0, 0, 0), rgba(0, 0, 0, 225))
 
 		pad := f32(20)
 		size := clamp(cover.w * 0.075, 16, 30)
 		title := font_ellipsize(&ui.bold, name, size, cover.w - pad * 2)
 		who := font_ellipsize(&ui.regular, artist, size * 0.62, cover.w - pad * 2)
-		ui_text(ui, &ui.bold, title, {cover.x + pad, cover.y + cover.h - pad - size * 2.1}, size, TEXT)
-		ui_text(ui, &ui.regular, who, {cover.x + pad, cover.y + cover.h - pad - size * 0.95}, size * 0.62, rgba(255, 255, 255, 190))
+		base := cover.y + cover.h - pad - 34
+		ui_text(ui, &ui.bold, title, {cover.x + pad, base - size * 1.75}, size, TEXT)
+		ui_text(ui, &ui.regular, who, {cover.x + pad, base - size * 0.6}, size * 0.62, rgba(255, 255, 255, 190))
 	}
 
+	// Progress belongs on the artwork: the control bar is hidden by default,
+	// so this is usually the only place it is shown.
 	if duration > 0 {
+		pad := f32(20)
 		frac := clamp(f32(progress) / f32(duration), 0, 1)
-		bar := Rect{cover.x, cover.y + cover.h - 5, cover.w, 5}
-		ui_rect(ui, bar, rgba(0, 0, 0, 150))
-		ui_rect(ui, {bar.x, bar.y, bar.w * frac, bar.h}, ACCENT)
+
+		bar := Rect{cover.x + pad, cover.y + cover.h - pad - 5, cover.w - pad * 2, 5}
+		ui_rect(ui, bar, rgba(255, 255, 255, 45), 2.5)
+		if frac > 0 {
+			fill := Rect{bar.x, bar.y, bar.w * frac, bar.h}
+			ui_rect(ui, fill, ACCENT, 2.5)
+			ui_glow(ui, {fill.x + fill.w, bar.y + 2.5}, 12, color_alpha(ACCENT, 0.55))
+		}
+
+		elapsed := ms_to_time(progress)
+		total := ms_to_time(duration)
+		ui_text(ui, &ui.regular, elapsed, {bar.x, bar.y - 20}, 12, rgba(255, 255, 255, 200))
+		ui_text(
+			ui,
+			&ui.regular,
+			total,
+			{bar.x + bar.w - font_width(&ui.regular, total, 12), bar.y - 20},
+			12,
+			rgba(255, 255, 255, 140),
+		)
 	}
 }
 
 @(private = "file")
-track_change_pulse :: proc(app: ^App, now_uri: string) {
+track_change_pulse :: proc(app: ^App, now_uri: string, layout: Grid, area: Rect) {
 	ui := &app.ui
 	if now_uri != app.last_now_uri {
 		delete(app.last_now_uri)
@@ -607,12 +683,14 @@ track_change_pulse :: proc(app: ^App, now_uri: string) {
 
 		// Remember where it sits so the grid can leave it out — it is already
 		// on screen as the feature tile.
+		previous_index := app.now_index
 		app.now_index = -1
-		big: string
+		big, small: string
 		sync.lock(&app.shared.mutex)
 		for t, i in app.shared.tracks {
 			if t.uri == now_uri {
 				app.now_index = i
+				small = strings.clone(t.art_url, context.temp_allocator)
 				big = strings.clone(
 					big_art_url(t.art_url_big, t.art_url),
 					context.temp_allocator,
@@ -622,9 +700,37 @@ track_change_pulse :: proc(app: ^App, now_uri: string) {
 		}
 		sync.unlock(&app.shared.mutex)
 		want_feature_art(app, big)
+
+		// The cover was somewhere in the grid a moment ago; fly it from there.
+		app.fly = 0
+		if app.now_index >= 0 && layout.cell > 0 {
+			slot := app.now_index
+			if previous_index >= 0 && app.now_index > previous_index do slot -= 1
+
+			row, col := grid_cell(layout, slot)
+			from := Rect {
+				area.x + TILE_GAP + f32(col) * layout.cell,
+				area.y - app.scroll.offset + TILE_GAP + f32(row) * layout.cell,
+				layout.cell - TILE_GAP,
+				layout.cell - TILE_GAP,
+			}
+			app.fly_from = from
+			app.fly_slot, app.fly_has_art = app.art[small]
+			app.fly = 1
+			app.wave = 1
+			app.wave_origin = {from.x + from.w / 2, from.y + from.h / 2}
+		}
 	}
 	if app.pulse > 0 {
 		app.pulse = max(app.pulse - ui.dt * 2.2, 0)
+		ui.animating = true
+	}
+	if app.fly > 0 {
+		app.fly = max(app.fly - ui.dt * 2.4, 0)
+		ui.animating = true
+	}
+	if app.wave > 0 {
+		app.wave = max(app.wave - ui.dt * 1.1, 0)
 		ui.animating = true
 	}
 }
@@ -1231,9 +1337,18 @@ fetch_art :: proc(s: ^Shared, req: Art_Request) {
 	// Covers arrive at 300px but a tile is nowhere near that on screen, and
 	// every slot in the bindless table costs VRAM for as long as it lives.
 	// Downscaling here keeps the whole table affordable.
+	// Whatever leaves here must be Odin-allocated: the caller frees it with
+	// delete, and stb_image's buffer came from malloc. The feature cover is
+	// requested at exactly its source size, so the resize path below does not
+	// always run.
 	out_w, out_h := int(w), int(h)
-	data := pixels[:out_w * out_h * 4]
-	if max(out_w, out_h) > req.max_px {
+	data: []byte
+	if max(out_w, out_h) <= req.max_px {
+		data = make([]byte, out_w * out_h * 4)
+		copy(data, pixels[:out_w * out_h * 4])
+		stbi.image_free(pixels)
+	}
+	if data == nil {
 		scale := f32(req.max_px) / f32(max(out_w, out_h))
 		nw := max(int(f32(out_w) * scale), 1)
 		nh := max(int(f32(out_h) * scale), 1)

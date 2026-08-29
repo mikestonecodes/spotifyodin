@@ -45,6 +45,7 @@ create_ui_pipeline :: proc(g: ^Gpu) {
 		{location = 4, format = .R32G32B32A32_SFLOAT, offset = u32(offset_of(Vertex, rect))},
 		{location = 5, format = .R32_SFLOAT, offset = u32(offset_of(Vertex, radius))},
 		{location = 6, format = .R32_UINT, offset = u32(offset_of(Vertex, effect))},
+		{location = 7, format = .R32_SFLOAT, offset = u32(offset_of(Vertex, param))},
 	}
 	vertex_input := vk.PipelineVertexInputStateCreateInfo {
 		sType                           = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,

@@ -18,6 +18,7 @@ layout(location = 3)      in vec2  v_pos;
 layout(location = 4) flat in vec4  v_rect;
 layout(location = 5) flat in float v_radius;
 layout(location = 6) flat in uint  v_effect;
+layout(location = 7) flat in float v_param;
 
 layout(location = 0) out vec4 out_col;
 
@@ -25,6 +26,7 @@ layout(location = 0) out vec4 out_col;
 #define EFFECT_GLOW     1u // soft radial falloff, for the halo behind a button
 #define EFFECT_SHEEN    2u // a highlight that travels along the progress fill
 #define EFFECT_RING     3u // a ring that fades outward, for click ripples
+#define EFFECT_WOBBLE   4u // artwork rippling like it is under water
 
 // Signed distance to a box with rounded corners, in pixels.
 float rounded_box(vec2 p, vec2 half_extent, float r) {
@@ -33,7 +35,17 @@ float rounded_box(vec2 p, vec2 half_extent, float r) {
 }
 
 void main() {
-	vec4 c = v_col * texture(textures[nonuniformEXT(v_tex)], v_uv);
+	vec2 uv = v_uv;
+
+	// Two crossed waves, so the surface rolls rather than shearing one way.
+	// v_param is the amplitude, which the caller fades to zero.
+	if (v_effect == EFFECT_WOBBLE) {
+		uv.x += sin(v_uv.y * 14.0 + pc.time * 7.0) * v_param;
+		uv.y += cos(v_uv.x * 11.0 + pc.time * 5.5) * v_param;
+		uv = clamp(uv, 0.0, 1.0);
+	}
+
+	vec4 c = v_col * texture(textures[nonuniformEXT(v_tex)], uv);
 
 	// Position within the quad, -1..1 on each axis.
 	vec2 p = (v_pos - v_rect.xy) / max(v_rect.zw, vec2(0.0001));
