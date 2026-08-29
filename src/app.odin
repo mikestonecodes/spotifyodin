@@ -677,22 +677,27 @@ draw_feature :: proc(app: ^App, r: Rect, name, artist: string, progress, duratio
 	}
 
 	if name != "" {
-		scrim := Rect{cover.x, cover.y + cover.h * 0.45, cover.w, cover.h * 0.55}
+		// The scrim only has to carry two lines now that the times are gone.
+		scrim := Rect{cover.x, cover.y + cover.h * 0.58, cover.w, cover.h * 0.42}
 		ui_gradient_v(ui, scrim, rgba(0, 0, 0, 0), rgba(0, 0, 0, 225))
 
-		pad := f32(20)
+		pad := f32(16)
 		size := clamp(cover.w * 0.075, 16, 30)
+		artist_size := size * 0.6
 		title := font_ellipsize(&ui.bold, name, size, cover.w - pad * 2)
-		who := font_ellipsize(&ui.regular, artist, size * 0.62, cover.w - pad * 2)
-		base := cover.y + cover.h - pad - 34
-		ui_text(ui, &ui.bold, title, {cover.x + pad, base - size * 1.75}, size, TEXT)
-		ui_text(ui, &ui.regular, who, {cover.x + pad, base - size * 0.6}, size * 0.62, rgba(255, 255, 255, 190))
+		who := font_ellipsize(&ui.regular, artist, artist_size, cover.w - pad * 2)
+
+		// Stacked up from the progress line, tight.
+		artist_y := cover.y + cover.h - pad - 5 - 10 - artist_size * 1.2
+		title_y := artist_y - size * 1.08
+		ui_text(ui, &ui.bold, title, {cover.x + pad, title_y}, size, TEXT)
+		ui_text(ui, &ui.regular, who, {cover.x + pad, artist_y}, artist_size, rgba(255, 255, 255, 195))
 	}
 
 	// Progress belongs on the artwork: the control bar is hidden by default,
 	// so this is usually the only place it is shown.
 	if duration > 0 {
-		pad := f32(20)
+		pad := f32(16)
 		frac := clamp(f32(progress) / f32(duration), 0, 1)
 
 		bar := Rect{cover.x + pad, cover.y + cover.h - pad - 5, cover.w - pad * 2, 5}
