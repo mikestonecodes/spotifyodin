@@ -8,6 +8,7 @@ import "core:crypto/aes"
 import "core:encoding/json"
 import "core:fmt"
 import "core:strings"
+import "core:sync"
 import vorbis "vendor:stb/vorbis"
 
 // Every Spotify audio file uses this IV; the key is the per-file one the
@@ -20,7 +21,24 @@ AUDIO_AES_IV := [16]byte {
 // Spotify prepends a header to the Ogg stream that the decoder must not see.
 SPOTIFY_OGG_HEADER_END :: 0xa7
 
+// Resolved once. This used to run on every track load, adding a round trip to
+// apresolve in front of every single storage-resolve.
+@(private = "file")
+g_spclient_host: string
+@(private = "file")
+g_spclient_mutex: sync.Mutex
+
 spclient_host :: proc() -> string {
+	sync.lock(&g_spclient_mutex)
+	defer sync.unlock(&g_spclient_mutex)
+	if g_spclient_host != "" do return g_spclient_host
+
+	g_spclient_host = spclient_resolve()
+	return g_spclient_host
+}
+
+@(private = "file")
+spclient_resolve :: proc() -> string {
 	res, ok := http_request("GET", "https://apresolve.spotify.com/?type=spclient", nil)
 	defer delete(res.body)
 	if ok && res.status == 200 {
@@ -41,7 +59,6 @@ spclient_host :: proc() -> string {
 // Wants the session token: spclient rejects a third-party app's token with 403.
 resolve_audio_url :: proc(session_token: string, file_id: []byte) -> (url: string, ok: bool) {
 	host := spclient_host()
-	defer delete(host)
 
 	endpoint := fmt.tprintf(
 		"https://%s/storage-resolve/files/audio/interactive/%s",

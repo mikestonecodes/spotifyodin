@@ -912,10 +912,14 @@ worker_main :: proc(app: ^App) {
 			if next >= len(order) do next = 0
 			if next < 0 do next = len(order) - 1
 
+			// Show the selection straight away. A preloaded track is ready in
+			// a moment, and an un-preloaded one takes a second or so — either
+			// way the grid should answer the click immediately.
+			publish_track(s, order[next])
 			set_status(s, fmt.tprintf("loading %s...", order[next].name))
+
 			if player_load(player, order[next].uri) {
 				index = next
-				publish_track(s, order[index])
 				sync.lock(&s.mutex)
 				s.is_playing = true
 				sync.unlock(&s.mutex)

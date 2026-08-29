@@ -4,10 +4,19 @@ package spoticyclint
 // No Spotify Connect device is involved — this is the thing that plays.
 
 import "core:fmt"
+import "core:os"
 import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
+
+@(private = "file")
+track_load_profile: bool
+
+@(private = "file")
+init_track_profile :: proc() {
+	track_load_profile = os.get_env("SPOTICYCLINT_PROFILE", context.temp_allocator) != ""
+}
 
 Player :: struct {
 	session:       ^AP_Session,
@@ -42,6 +51,7 @@ Preloader :: struct {
 }
 
 player_init :: proc(p: ^Player, c: Client) -> bool {
+	init_track_profile()
 	p.client = c
 
 	// The access point wants a token from Spotify's own client, which is a
@@ -218,6 +228,7 @@ load_track_audio :: proc(
 		for f in files {
 			if f.format != want do continue
 
+			t0 := time.now()
 			key, key_ok := ap_audio_key(session, f.gid, f.file_id)
 			if !key_ok do continue
 
@@ -225,13 +236,24 @@ load_track_audio :: proc(
 			if !url_ok do continue
 			defer delete(url)
 
+			t1 := time.now()
 			encrypted, dl_ok := download_audio_file(url)
 			if !dl_ok do continue
 			defer delete(encrypted)
 
+			t2 := time.now()
 			ogg := decrypt_audio_file(encrypted, key)
 			decoded, decode_ok := decode_ogg(ogg)
 			if !decode_ok do continue
+			if track_load_profile {
+				fmt.eprintfln(
+					"load: key+resolve %.0fms  download %.0fms (%dKB)  decrypt+decode %.0fms",
+					time.duration_milliseconds(time.diff(t0, t1)),
+					time.duration_milliseconds(time.diff(t1, t2)),
+					len(encrypted) / 1024,
+					time.duration_milliseconds(time.since(t2)),
+				)
+			}
 
 			if decoded.channels != OUT_CHANNELS || decoded.sample_rate != OUT_RATE {
 				fmt.eprintfln(
