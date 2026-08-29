@@ -8,8 +8,10 @@ import "core:thread"
 import "core:time"
 import stbi "vendor:stb/image"
 
-BG :: Color(0xff121212)
-PANEL :: Color(0xff181818)
+// Alpha here is the window's own transparency: the compositor blends whatever
+// is behind it through the background and the panels.
+BG :: Color(0xd2121212)
+PANEL :: Color(0xdc181818)
 PANEL_HI :: Color(0xff242424)
 ACCENT :: Color(0xff54b91d) // Spotify green, RGBA8 little endian
 TEXT :: Color(0xffffffff)
@@ -21,13 +23,12 @@ WARN :: Color(0xff4d4dff) // something needs the user's attention
 // budget the loop would render as fast as the GPU allows for no visible gain.
 FRAME_BUDGET :: 8 * time.Millisecond
 
-BAR_H :: 92
-
-// Grid of covers rather than a list: at this window width a row used maybe a
-// third of it and left the rest empty.
-TILE_MIN :: 150 // smallest a cover is allowed to get before dropping a column
-TILE_GAP :: 14
-TILE_LABEL :: 46 // title and artist under each cover
+// One grid. The playing track is a large tile in the top-left corner and
+// everything else flows around it. Covers only — the name is written into the
+// big tile, so the small ones need no labels.
+TILE_MIN :: 150
+TILE_GAP :: 12
+BAR_H :: 88
 
 Command :: enum {
 	None,
@@ -92,7 +93,16 @@ App :: struct {
 	// Set when the playing track changes, so the grid can react to it.
 	last_now_uri: string,
 	pulse:        f32, // 1 -> 0 right after a change
-	pulse_index:  int,
+	now_index:    int, // where the playing track sits in the queue, or -1
+
+	// The big cover turns over when the track changes: `flip` runs 1 -> 0 and
+	// `flip_dir` decides which way, while `prev_art` is what it turns away
+	// from.
+	flip:         f32,
+	flip_dir:     f32,
+	prev_art:     string,
+	now_art_url:  string,
+	last_index:   int,
 
 	// Owned by the worker, but the UI thread calls the audio-only operations
 	// on it directly: those touch nothing but a mutex-guarded buffer, and
@@ -360,44 +370,61 @@ draw_app :: proc(app: ^App) {
 
 	list := Rect{0, 0, w, h - BAR_H}
 	if loaded && count > 0 {
-		draw_queue(app, list, now_uri, progress, duration)
+		draw_queue(app, list, now_uri, now_name, now_artist, progress, duration)
 	} else {
 		ui_text_centred(ui, &ui.regular, status, list, 18, status_error ? WARN : MUTED)
 	}
 
-	draw_now_playing(
-		app,
-		Rect{0, h - BAR_H, w, BAR_H},
-		now_name,
-		now_artist,
-		is_playing,
-		progress,
-		duration,
-		status,
-		status_error,
-	)
+	draw_controls(app, Rect{0, h - BAR_H, w, BAR_H}, is_playing, progress, duration, status, status_error)
 }
 
 @(private = "file")
 Grid :: struct {
-	cols:   int,
-	tile:   f32, // cover edge, square
-	cell_w: f32,
-	cell_h: f32,
+	cols:    int,
+	feature: int, // the playing tile spans this many cells each way
+	cell:    f32,
+	head:    int, // cells beside the feature, in the rows it occupies
+	rows:    int,
 }
 
 @(private = "file")
-grid_for :: proc(width: f32) -> (g: Grid) {
+grid_for :: proc(width: f32, count: int) -> (g: Grid) {
 	usable := width - TILE_GAP
-	g.cols = max(int(usable / (TILE_MIN + TILE_GAP)), 2)
-	g.cell_w = usable / f32(g.cols)
-	g.tile = g.cell_w - TILE_GAP
-	g.cell_h = g.tile + TILE_LABEL
+	g.cols = max(int(usable / (TILE_MIN + TILE_GAP)), 3)
+	g.cell = usable / f32(g.cols)
+	g.feature = g.cols >= 6 ? 3 : 2
+	g.head = g.feature * (g.cols - g.feature)
+
+	remaining := max(count - g.head, 0)
+	g.rows = g.feature + (remaining + g.cols - 1) / g.cols
 	return
 }
 
+// Where the n-th track sits, with the feature block filling the top-left.
 @(private = "file")
-draw_queue :: proc(app: ^App, r: Rect, now_uri: string, progress, duration: int) {
+grid_cell :: proc(g: Grid, n: int) -> (row, col: int) {
+	side := g.cols - g.feature
+	if n < g.head do return n / side, g.feature + n % side
+	j := n - g.head
+	return g.feature + j / g.cols, j % g.cols
+}
+
+// The index range that lands on a given row.
+@(private = "file")
+grid_row_range :: proc(g: Grid, row: int) -> (first, last: int) {
+	side := g.cols - g.feature
+	if row < g.feature do return row * side, (row + 1) * side
+	j := row - g.feature
+	return g.head + j * g.cols, g.head + (j + 1) * g.cols
+}
+
+@(private = "file")
+draw_queue :: proc(
+	app: ^App,
+	r: Rect,
+	now_uri, now_name, now_artist: string,
+	progress, duration: int,
+) {
 	ui := &app.ui
 	s := &app.shared
 
@@ -405,128 +432,166 @@ draw_queue :: proc(app: ^App, r: Rect, now_uri: string, progress, duration: int)
 	count := len(s.tracks)
 	sync.unlock(&s.mutex)
 
-	g := grid_for(r.w)
-	rows := (count + g.cols - 1) / g.cols
-	ui_begin_scroll(ui, r, &app.scroll, f32(rows) * g.cell_h + TILE_GAP)
+	track_change_pulse(app, now_uri)
 
-	first_row := max(int(app.scroll.offset / g.cell_h) - 1, 0)
-	last_row := min(first_row + int(r.h / g.cell_h) + 3, rows)
-	first := first_row * g.cols
-	last := min(last_row * g.cols, count)
+	// The playing track is the feature tile, so the grid holds everything else.
+	skip := app.now_index >= 0 && app.now_index < count
+	flow_count := skip ? count - 1 : count
 
-	// One lock for everything on screen, rather than one per tile per frame.
+	g := grid_for(r.w, flow_count)
+	ui_begin_scroll(ui, r, &app.scroll, f32(g.rows) * g.cell + TILE_GAP)
+
+	first_row := max(int(app.scroll.offset / g.cell) - 1, 0)
+	last_row := min(first_row + int(r.h / g.cell) + 3, g.rows)
+
+	// The playing track, large, in the corner.
+	feature := Rect {
+		r.x + TILE_GAP,
+		r.y - app.scroll.offset + TILE_GAP,
+		g.cell * f32(g.feature) - TILE_GAP,
+		g.cell * f32(g.feature) - TILE_GAP,
+	}
+	if feature.y + feature.h > r.y && feature.y < r.y + r.h {
+		draw_feature(app, feature, now_name, now_artist, progress, duration)
+	}
+
+	first, _ := grid_row_range(g, first_row)
+	_, last := grid_row_range(g, max(last_row - 1, first_row))
+	first = clamp(first, 0, flow_count)
+	last = clamp(last, 0, flow_count)
+
+	// Slot n maps to the n-th track that is not the one playing.
 	visible := make([]Track, max(last - first, 0), context.temp_allocator)
+	indices := make([]int, len(visible), context.temp_allocator)
 	sync.lock(&s.mutex)
-	for i in first ..< last do visible[i - first] = s.tracks[i]
+	for slot in first ..< last {
+		i := skip && slot >= app.now_index ? slot + 1 : slot
+		visible[slot - first] = s.tracks[i]
+		indices[slot - first] = i
+	}
 	sync.unlock(&s.mutex)
 
-	// Notice a track change here rather than in the worker, so the animation
-	// starts on the frame the UI first sees it.
-	if now_uri != app.last_now_uri {
-		delete(app.last_now_uri)
-		app.last_now_uri = strings.clone(now_uri)
-		app.pulse = 1
-		app.pulse_index = -1
-		sync.lock(&s.mutex)
-		for t, i in s.tracks {
-			if t.uri == now_uri {
-				app.pulse_index = i
-				break
-			}
-		}
-		sync.unlock(&s.mutex)
-	}
-	if app.pulse > 0 {
-		app.pulse = max(app.pulse - ui.dt * 1.6, 0)
-		ui.animating = true
-	}
-
 	for track, vi in visible {
-		i := first + vi
-		col := i % g.cols
-		row := i / g.cols
+		row, col := grid_cell(g, first + vi)
+		i := indices[vi]
 
 		cell := Rect {
-			r.x + TILE_GAP + f32(col) * g.cell_w,
-			r.y - app.scroll.offset + TILE_GAP + f32(row) * g.cell_h,
-			g.tile,
-			g.cell_h - TILE_GAP,
+			r.x + TILE_GAP + f32(col) * g.cell,
+			r.y - app.scroll.offset + TILE_GAP + f32(row) * g.cell,
+			g.cell - TILE_GAP,
+			g.cell - TILE_GAP,
 		}
 		if cell.y > r.y + r.h || cell.y + cell.h < r.y do continue
 
-		is_now := track.uri == now_uri
-		id := ui_id("tile", i)
-		clicked, hovered := ui_invisible_button(ui, id, cell)
-		if clicked do request_play_index(app, i)
-
-		// Covers lift toward the pointer and settle back; the playing one
-		// stays lifted.
-		lift := ui_anim(ui, id, hovered ? 1 : 0, 16)
-		glow := ui_anim(ui, id ~ 1, is_now ? 1 : 0, 10)
-		press := ui_anim(ui, id ~ 2, ui.active == id ? 1 : 0, 26)
-
-		// The cover that just started swells and settles.
-		pulse := i == app.pulse_index ? app.pulse : 0
-		pop := pulse * pulse * 0.14
-		scale := 1 + lift * 0.05 + glow * 0.02 - press * 0.05 + pop
-
-		cover := Rect{cell.x, cell.y, g.tile, g.tile}
-		grow := g.tile * (scale - 1) / 2
-		cover = rect_inset(cover, -grow, -grow)
-		radius := g.tile * 0.06
-
-		// Accent ring behind the playing cover, plus a halo that breathes.
-		if glow > 0.01 {
-			ring := rect_inset(cover, -3 - glow * 2, -3 - glow * 2)
-			ui_rect(ui, ring, color_alpha(ACCENT, glow), radius + 4)
-			ui_glow(
-				ui,
-				{cover.x + cover.w / 2, cover.y + cover.h / 2},
-				g.tile * (0.85 + pulse * 0.35),
-				color_alpha(ACCENT, 0.22 * glow + pulse * 0.35),
-			)
-		}
-
-		slot, has_art := app.art[track.art_url]
-		if !has_art do want_art(app, track.art_url)
-
-		// Art fades in instead of popping.
-		fade := ui_anim(ui, id ~ 3, has_art ? 1 : 0, 8)
-		ui_rect(ui, cover, PANEL_HI, radius)
-		if has_art && fade > 0.01 {
-			ui_image(ui, cover, slot, radius, rgba(255, 255, 255, u8(255 * fade)))
-		}
-
-		// Hovering brightens the cover a little.
-		if lift > 0.01 {
-			ui_rect(ui, cover, rgba(255, 255, 255, u8(18 * lift)), radius)
-		}
-
-		// The playing cover carries its own progress along the bottom edge.
-		if glow > 0.5 && duration > 0 {
-			frac := clamp(f32(progress) / f32(duration), 0, 1)
-			bar := Rect{cover.x, cover.y + cover.h - 5, cover.w, 5}
-			ui_rect(ui, bar, rgba(0, 0, 0, 130), 2.5)
-			ui_rect(ui, {bar.x, bar.y, bar.w * frac, bar.h}, ACCENT, 2.5)
-		}
-
-		text_w := g.tile - 4
-		title := font_ellipsize(&ui.bold, track.name, 14, text_w)
-		artist := font_ellipsize(&ui.regular, track.artist, 12, text_w)
-		ui_text(ui, &ui.bold, title, {cell.x + 2, cell.y + g.tile + 8}, 14, is_now ? ACCENT : TEXT)
-		ui_text(ui, &ui.regular, artist, {cell.x + 2, cell.y + g.tile + 26}, 12, MUTED)
+		draw_tile(app, cell, track, i, false)
 	}
 
 	ui_end_scroll(ui, r, &app.scroll, DIM)
 }
 
-// Minimal on purpose: the grid already shows what is playing, so the bar is
-// only the things you reach for — a scrub line, the transport, and volume.
 @(private = "file")
-draw_now_playing :: proc(
+draw_tile :: proc(app: ^App, cell: Rect, track: Track, i: int, is_now: bool) {
+	ui := &app.ui
+	id := ui_id("tile", i)
+	clicked, hovered := ui_invisible_button(ui, id, cell)
+	if clicked do request_play_index(app, i)
+
+	lift := ui_anim(ui, id, hovered ? 1 : 0, 16)
+	glow := ui_anim(ui, id ~ 1, is_now ? 1 : 0, 10)
+	press := ui_anim(ui, id ~ 2, ui.active == id ? 1 : 0, 26)
+	scale := 1 + lift * 0.06 - press * 0.05
+
+	grow := cell.w * (scale - 1) / 2
+	cover := rect_inset(cell, -grow, -grow)
+	radius := cell.w * 0.055
+
+	if glow > 0.01 {
+		ui_rect(ui, rect_inset(cover, -3 - glow * 2, -3 - glow * 2), color_alpha(ACCENT, glow), radius + 4)
+	}
+
+	slot, has_art := app.art[track.art_url]
+	if !has_art do want_art(app, track.art_url)
+
+	fade := ui_anim(ui, id ~ 3, has_art ? 1 : 0, 8)
+	ui_rect(ui, cover, PANEL_HI, radius)
+	if has_art && fade > 0.01 {
+		ui_image(ui, cover, slot, radius, rgba(255, 255, 255, u8(255 * fade)))
+	}
+	if lift > 0.01 {
+		ui_rect(ui, cover, rgba(255, 255, 255, u8(22 * lift)), radius)
+	}
+}
+
+// The playing track: the cover, its name written into the artwork, and how far
+// through it is along the bottom edge.
+@(private = "file")
+draw_feature :: proc(app: ^App, r: Rect, name, artist: string, progress, duration: int) {
+	ui := &app.ui
+	radius := r.w * 0.035
+
+	// A small swell when the track changes, and nothing else moving.
+	pop := app.pulse * app.pulse * 0.03
+	cover := rect_inset(r, -r.w * pop / 2, -r.w * pop / 2)
+
+	ui_rect(ui, cover, PANEL_HI, radius)
+	if slot, has := current_art_slot(app); has {
+		ui_image(ui, cover, slot, radius)
+	}
+	if app.pulse > 0.01 {
+		ui_rect(ui, cover, rgba(255, 255, 255, u8(40 * app.pulse)), radius)
+	}
+
+	if name != "" {
+		scrim := Rect{cover.x, cover.y + cover.h * 0.52, cover.w, cover.h * 0.48}
+		ui_gradient_v(ui, scrim, rgba(0, 0, 0, 0), rgba(0, 0, 0, 225))
+
+		pad := f32(20)
+		size := clamp(cover.w * 0.075, 16, 30)
+		title := font_ellipsize(&ui.bold, name, size, cover.w - pad * 2)
+		who := font_ellipsize(&ui.regular, artist, size * 0.62, cover.w - pad * 2)
+		ui_text(ui, &ui.bold, title, {cover.x + pad, cover.y + cover.h - pad - size * 2.1}, size, TEXT)
+		ui_text(ui, &ui.regular, who, {cover.x + pad, cover.y + cover.h - pad - size * 0.95}, size * 0.62, rgba(255, 255, 255, 190))
+	}
+
+	if duration > 0 {
+		frac := clamp(f32(progress) / f32(duration), 0, 1)
+		bar := Rect{cover.x, cover.y + cover.h - 5, cover.w, 5}
+		ui_rect(ui, bar, rgba(0, 0, 0, 150))
+		ui_rect(ui, {bar.x, bar.y, bar.w * frac, bar.h}, ACCENT)
+	}
+}
+
+@(private = "file")
+track_change_pulse :: proc(app: ^App, now_uri: string) {
+	ui := &app.ui
+	if now_uri != app.last_now_uri {
+		delete(app.last_now_uri)
+		app.last_now_uri = strings.clone(now_uri)
+		app.pulse = 1
+
+		// Remember where it sits so the grid can leave it out — it is already
+		// on screen as the feature tile.
+		app.now_index = -1
+		sync.lock(&app.shared.mutex)
+		for t, i in app.shared.tracks {
+			if t.uri == now_uri {
+				app.now_index = i
+				break
+			}
+		}
+		sync.unlock(&app.shared.mutex)
+	}
+	if app.pulse > 0 {
+		app.pulse = max(app.pulse - ui.dt * 2.2, 0)
+		ui.animating = true
+	}
+}
+
+// Just the controls: the feature tile already shows what is playing.
+@(private = "file")
+draw_controls :: proc(
 	app: ^App,
 	r: Rect,
-	name, artist: string,
 	is_playing: bool,
 	progress, duration: int,
 	status: string,
@@ -535,8 +600,6 @@ draw_now_playing :: proc(
 	ui := &app.ui
 	ui_rect(ui, r, PANEL)
 
-	// The scrub line runs the full width along the top edge of the bar, and
-	// thickens when you go near it.
 	hit := Rect{r.x, r.y - 6, r.w, 20}
 	seek_clicked, seek_hovered := ui_invisible_button(ui, ui_id("seek"), hit)
 	grow := ui_anim(ui, ui_id("seekgrow"), seek_hovered || ui.active == ui_id("seek") ? 1 : 0, 18)
@@ -550,7 +613,6 @@ draw_now_playing :: proc(
 		fill := Rect{line.x, line.y, line.w * frac, line_h}
 		if grow > 0.01 do ui_rect_sheen(ui, fill, ACCENT)
 		else do ui_rect(ui, fill, ACCENT)
-		// A little light spills off the playhead.
 		ui_glow(ui, {fill.x + fill.w, line.y + line_h / 2}, 14 + grow * 10, color_alpha(ACCENT, 0.5))
 	}
 	if grow > 0.01 && duration > 0 {
@@ -561,20 +623,17 @@ draw_now_playing :: proc(
 	}
 
 	cy := r.y + (r.h + line_h) / 2
-
-	// Transport, centred.
 	cx := r.w / 2
-	if transport_button(ui, "prev", Rect{cx - 104, cy - 23, 46, 46}, .Previous_Icon, false) {
+	if transport_button(ui, "prev", Rect{cx - 100, cy - 22, 44, 44}, .Previous_Icon, false) {
 		push_command(app, .Previous)
 	}
-	if transport_button(ui, "play", Rect{cx - 31, cy - 31, 62, 62}, is_playing ? .Pause_Icon : .Play_Icon, true) {
+	if transport_button(ui, "play", Rect{cx - 29, cy - 29, 58, 58}, is_playing ? .Pause_Icon : .Play_Icon, true) {
 		toggle_playback(app)
 	}
-	if transport_button(ui, "next", Rect{cx + 58, cy - 23, 46, 46}, .Next_Icon, false) {
+	if transport_button(ui, "next", Rect{cx + 56, cy - 22, 44, 44}, .Next_Icon, false) {
 		push_command(app, .Next)
 	}
 
-	// Volume, deliberately large.
 	sync.lock(&app.shared.mutex)
 	volume := app.shared.volume
 	sync.unlock(&app.shared.mutex)
@@ -587,13 +646,11 @@ draw_now_playing :: proc(
 		app.shared.volume = new_volume
 	}
 
-	// Errors are the only thing worth words down here.
 	if status_error {
-		ui_text(ui, &ui.regular, font_ellipsize(&ui.regular, status, 12, 300), {r.x + 22, cy + 14}, 12, WARN)
+		ui_text(ui, &ui.regular, font_ellipsize(&ui.regular, status, 12, 320), {r.x + 20, cy - 7}, 12, WARN)
 	}
 }
 
-// Chunky and glowing: this is the one control that wants to be grabbable.
 @(private = "file")
 volume_slider :: proc(ui: ^UI, r: Rect, value: f32) -> f32 {
 	id := ui_id("volume")

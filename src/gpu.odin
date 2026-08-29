@@ -48,6 +48,7 @@ Gpu :: struct {
 
 	// Framebuffer pixels per logical UI unit, from the compositor.
 	ui_scale:        f32,
+	composite_alpha: vk.CompositeAlphaFlagsKHR,
 
 	// 4x multisampled target. Rounded rects anti-alias themselves in the
 	// shader, but the triangles in the transport icons cannot, and jagged play
@@ -330,6 +331,22 @@ create_swapchain :: proc(g: ^Gpu, width, height: u32) {
 		}
 	}
 
+	// Ask the compositor to blend the window with what is behind it. Our
+	// blending already writes premultiplied results (colour multiplied by
+	// source alpha, alpha accumulated with ONE), so PRE_MULTIPLIED is the
+	// mode that matches; POST_MULTIPLIED is the fallback and OPAQUE the
+	// last resort.
+	composite := vk.CompositeAlphaFlagsKHR{.OPAQUE}
+	if .PRE_MULTIPLIED in caps.supportedCompositeAlpha {
+		composite = {.PRE_MULTIPLIED}
+	} else if .POST_MULTIPLIED in caps.supportedCompositeAlpha {
+		composite = {.POST_MULTIPLIED}
+	}
+	g.composite_alpha = composite
+	if os.get_env("SPOTICYCLINT_PROFILE", context.temp_allocator) != "" {
+		fmt.eprintfln("composite alpha: %v (supported: %v)", composite, caps.supportedCompositeAlpha)
+	}
+
 	count := caps.minImageCount + 1
 	if present_mode == .MAILBOX do count = max(count, 3)
 	if caps.maxImageCount > 0 do count = min(count, caps.maxImageCount)
@@ -346,7 +363,7 @@ create_swapchain :: proc(g: ^Gpu, width, height: u32) {
 		imageUsage       = {.COLOR_ATTACHMENT},
 		imageSharingMode = .EXCLUSIVE,
 		preTransform     = caps.currentTransform,
-		compositeAlpha   = {.OPAQUE},
+		compositeAlpha   = composite,
 		presentMode      = present_mode,
 		clipped          = true,
 		oldSwapchain     = old,

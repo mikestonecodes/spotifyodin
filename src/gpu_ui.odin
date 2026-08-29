@@ -190,11 +190,13 @@ gpu_draw :: proc(g: ^Gpu, ui: ^UI, clear_color: Color) -> bool {
 
 	swap_barrier(cmd, g.images[image_index], .UNDEFINED, .COLOR_ATTACHMENT_OPTIMAL)
 
+	// Premultiplied, to match the composite mode the swapchain asked for.
+	alpha := f32((u32(clear_color) >> 24) & 0xff) / 255
 	c := [4]f32 {
-		f32(u32(clear_color) & 0xff) / 255,
-		f32((u32(clear_color) >> 8) & 0xff) / 255,
-		f32((u32(clear_color) >> 16) & 0xff) / 255,
-		1,
+		f32(u32(clear_color) & 0xff) / 255 * alpha,
+		f32((u32(clear_color) >> 8) & 0xff) / 255 * alpha,
+		f32((u32(clear_color) >> 16) & 0xff) / 255 * alpha,
+		alpha,
 	}
 	// Render into the multisampled image and resolve straight into the
 	// swapchain image; the MSAA contents themselves are never needed again.

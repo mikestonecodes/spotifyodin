@@ -1,5 +1,7 @@
 package spoticyclint
 
+import "core:math"
+
 // Immediate mode: there is no widget tree and nothing is retained between
 // frames except two ids (what the mouse is over, and what it grabbed). Every
 // frame rebuilds one vertex buffer; the bindless table means the whole thing
@@ -204,6 +206,70 @@ ui_quad :: proc(
 
 	append(&ui.indices, base, base + 1, base + 2, base, base + 2, base + 3)
 	cmd.index_count += 6
+}
+
+// The general case: four corners, each with its own position, texture
+// coordinate and colour. Everything else here is a special case of it.
+ui_quad_corners :: proc(
+	ui: ^UI,
+	p: [4][2]f32,
+	uv: [4][2]f32,
+	col: [4]Color,
+	tex: u32,
+	effect: Effect = .None,
+) {
+	cmd := current_cmd(ui)
+	base := u32(len(ui.verts))
+	shape := [4]f32{0, 0, 0, 0}
+
+	for i in 0 ..< 4 {
+		append(&ui.verts, Vertex{p[i], uv[i], col[i], tex, shape, NO_ROUND, effect})
+	}
+	append(&ui.indices, base, base + 1, base + 2, base, base + 2, base + 3)
+	cmd.index_count += 6
+}
+
+// A vertical fade, for laying text over artwork without it getting lost.
+ui_gradient_v :: proc(ui: ^UI, r: Rect, top, bottom: Color) {
+	if r.w <= 0 || r.h <= 0 do return
+	if rect_intersect(r, ui.clip).w <= 0 do return
+	ui_quad_corners(
+		ui,
+		{{r.x, r.y}, {r.x + r.w, r.y}, {r.x + r.w, r.y + r.h}, {r.x, r.y + r.h}},
+		{{0, 0}, {1, 0}, {1, 1}, {0, 1}},
+		{top, top, bottom, bottom},
+		WHITE_TEX,
+	)
+}
+
+// A card turning about its vertical axis. `turn` is -1..1, zero facing us.
+// Not a real projection: the leading edge is made taller and the trailing edge
+// shorter, which is what sells the rotation at this size.
+ui_image_turn :: proc(ui: ^UI, r: Rect, tex: u32, turn: f32, tint: Color = 0xffffffff) {
+	t := clamp(turn, -1, 1)
+	squeeze := math.cos(t * math.PI * 0.5) // 1 face on, 0 edge on
+	if abs(squeeze) < 0.002 do return
+
+	cx := r.x + r.w / 2
+	half_w := r.w / 2 * abs(squeeze)
+	lean := math.sin(t * math.PI * 0.5) * 0.16 // how much perspective to fake
+
+	left_h := r.h * (1 + lean) / 2
+	right_h := r.h * (1 - lean) / 2
+	cy := r.y + r.h / 2
+
+	ui_quad_corners(
+		ui,
+		{
+			{cx - half_w, cy - left_h},
+			{cx + half_w, cy - right_h},
+			{cx + half_w, cy + right_h},
+			{cx - half_w, cy + left_h},
+		},
+		{{0, 0}, {1, 0}, {1, 1}, {0, 1}},
+		{tint, tint, tint, tint},
+		tex,
+	)
 }
 
 // A flat triangle, used for the play and skip glyphs.
