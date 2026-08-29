@@ -91,6 +91,9 @@ App :: struct {
 	saved_volume: f32,
 
 	// Set when the playing track changes, so the grid can react to it.
+	// The control bar stays out of the way until asked for.
+	show_bar:     bool,
+
 	last_now_uri: string,
 	pulse:        f32, // 1 -> 0 right after a change
 	now_index:    int, // where the playing track sits in the queue, or -1
@@ -275,6 +278,7 @@ Frame_State :: struct {
 	scroll:       f32,
 	width:        int,
 	height:       int,
+	bar:          bool,
 }
 
 @(private = "file")
@@ -299,6 +303,7 @@ frame_state :: proc(app: ^App) -> (fs: Frame_State) {
 
 	fs.art_count = len(app.art)
 	fs.scroll = app.scroll.target
+	fs.bar = app.show_bar
 	fs.width = app.win.width
 	fs.height = app.win.height
 	return
@@ -309,9 +314,14 @@ handle_keys :: proc(app: ^App) {
 	if window_key_pressed(&app.win, KEY_ESC) || window_key_pressed(&app.win, KEY_Q) {
 		app.win.should_close = true
 	}
+	// j / k / l for previous, pause, next; ';' shows and hides the controls.
 	if window_key_pressed(&app.win, KEY_SPACE) do toggle_playback(app)
+	if window_key_pressed(&app.win, KEY_K) do toggle_playback(app)
 	if window_key_pressed(&app.win, KEY_RIGHT) do push_command(app, .Next)
+	if window_key_pressed(&app.win, KEY_L) do push_command(app, .Next)
 	if window_key_pressed(&app.win, KEY_LEFT) do push_command(app, .Previous)
+	if window_key_pressed(&app.win, KEY_J) do push_command(app, .Previous)
+	if window_key_pressed(&app.win, KEY_SEMICOLON) do app.show_bar = !app.show_bar
 	if window_key_pressed(&app.win, KEY_R) do push_command(app, .Reshuffle)
 
 	step: f32 = 0
@@ -368,14 +378,28 @@ draw_app :: proc(app: ^App) {
 	}
 	_ = since
 
-	list := Rect{0, 0, w, h - BAR_H}
+	// The bar slides up out of the bottom edge, and the grid takes the space
+	// back as it goes.
+	shown := ui_anim(ui, ui_id("bar"), app.show_bar ? 1 : 0, 16)
+
+	list := Rect{0, 0, w, h - BAR_H * shown}
 	if loaded && count > 0 {
 		draw_queue(app, list, now_uri, now_name, now_artist, progress, duration)
 	} else {
 		ui_text_centred(ui, &ui.regular, status, list, 18, status_error ? WARN : MUTED)
 	}
 
-	draw_controls(app, Rect{0, h - BAR_H, w, BAR_H}, is_playing, progress, duration, status, status_error)
+	if shown > 0.001 {
+		draw_controls(
+			app,
+			Rect{0, h - BAR_H * shown, w, BAR_H},
+			is_playing,
+			progress,
+			duration,
+			status,
+			status_error,
+		)
+	}
 }
 
 @(private = "file")

@@ -23,6 +23,10 @@ KEY_UP :: 103
 KEY_DOWN :: 108
 KEY_PAGEUP :: 104
 KEY_PAGEDOWN :: 109
+KEY_J :: 36
+KEY_K :: 37
+KEY_L :: 38
+KEY_SEMICOLON :: 39
 
 Input :: struct {
 	mouse:          [2]f32,
