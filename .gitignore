@@ -53,3 +53,12 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# --- spoticyclint ---
+/spoticyclint
+*.bin
+/track.wav
+
+# src/shaders/*.spv and src/wayland/protocol.odin ARE committed on purpose,
+# so the project builds without glslc or the protocol XML.
+!src/shaders/*.spv

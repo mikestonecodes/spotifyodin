@@ -1,0 +1,98 @@
+package spoticyclint
+
+// Vectors generated from the reference Rust implementation in
+// reference/shannon/shannon.rs, at the lengths that exercise the whole-word,
+// trailing-byte and carried-over-byte paths — and split the way the AP codec
+// splits a packet, header first and payload second.
+
+import "core:encoding/hex"
+import "core:testing"
+
+Shannon_Vector :: struct {
+	n:      int,
+	nonce:  u32,
+	cipher: string,
+	plain:  string,
+	mac:    string,
+}
+
+SHANNON_VECTORS := [?]Shannon_Vector{
+	{0, 0, "617de9", "ab0000", "5da2cd79"},
+	{0, 1, "109726", "ab0000", "b776cc90"},
+	{0, 7, "3fdc4d", "ab0000", "0e7d5e9d"},
+	{1, 0, "617de828", "ab000103", "1450ebaa"},
+	{1, 1, "109727ac", "ab000103", "8e8905ab"},
+	{1, 7, "3fdc4c0c", "ab000103", "9b646541"},
+	{2, 0, "617deb2864", "ab0002030a", "36bf8c6f"},
+	{2, 1, "109724ac99", "ab0002030a", "2bcec1d7"},
+	{2, 7, "3fdc4f0c9f", "ab0002030a", "d26d622a"},
+	{3, 0, "617dea28204f", "ab0003030a11", "34907380"},
+	{3, 1, "109725acd9c0", "ab0003030a11", "79b4712b"},
+	{3, 7, "3fdc4e0cf77b", "ab0003030a11", "50492afc"},
+	{4, 0, "617ded2869c731", "ab0004030a1118", "2d46395c"},
+	{4, 1, "109722acb340df", "ab0004030a1118", "775f94cf"},
+	{4, 7, "3fdc490c3faae5", "ab0004030a1118", "b29e7776"},
+	{5, 0, "617dec2810cf69df", "ab0005030a11181f", "94d6fbb2"},
+	{5, 1, "109723acfbc5cfe7", "ab0005030a11181f", "4617bae6"},
+	{5, 7, "3fdc480c4f8a8146", "ab0005030a11181f", "cec3b62f"},
+	{7, 0, "617dee2804cf29ff4284", "ab0007030a11181f262d", "69d496a0"},
+	{7, 1, "109721acf9c4bb63e367", "ab0007030a11181f262d", "88798ed5"},
+	{7, 7, "3fdc4a0ccfda090726de", "ab0007030a11181f262d", "fc68a71f"},
+	{8, 0, "617de1283a1c9045d63ca0", "ab0008030a11181f262d34", "e39acf27"},
+	{8, 1, "10972eac9bc54ee4dd671b", "ab0008030a11181f262d34", "db96e5e5"},
+	{8, 7, "3fdc450c99334e66fc3b58", "ab0008030a11181f262d34", "8734d981"},
+	{15, 0, "617de6284ec5087a8f1e8ecc6771630eca50", "ab000f030a11181f262d343b424950575e65", "ce8819fb"},
+	{15, 1, "109729acab478e9480d450668aa65ea31516", "ab000f030a11181f262d343b424950575e65", "d4f083e6"},
+	{15, 7, "3fdc420cafb805d771f80d60bb5d38846958", "ab000f030a11181f262d343b424950575e65", "b34bb4dd"},
+	{16, 0, "617df928e176b3e370264d721e0166ba098d7b", "ab0010030a11181f262d343b424950575e656c", "d11c64c4"},
+	{16, 1, "109736ac1b514fe3a723ebcf01dbb8e4c7205c", "ab0010030a11181f262d343b424950575e656c", "61e7262c"},
+	{16, 7, "3fdc5d0cee6a35c57535753553ee167e12fdd4", "ab0010030a11181f262d343b424950575e656c", "917c7f42"},
+	{100, 0, "617d8d286fc500bf894630625cc1c91ad570f26b05a94b9f2caf612ee80a36fde47171e6d57eed53b1b3112afa2b9371dc6ae10e1ebae7a6621905564ce76b0670a65966dfbd8103bb8d1efe182a8ad14e612edec42b0e4b03288edfc2bdecb8674162dd369e40", "ab0064030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8", "54849f9e"},
+	{100, 1, "109742ace7025753d3f0f532bce9932680276e33bbced3ec2fa0356454e797c901fefd2e9364be9838a7afac0f4d248b258835aa0cfb86c8de55f4c0b05cb918d4c61f82e5a274c1c267eda731c9f64e74bfd9cf7a94d2fc21a8368bd3383c5b9bb7d191e1e309", "ab0064030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8", "8046fc96"},
+	{100, 7, "3fdc290c1fc38b09d6b02490a1653c037978ec9f60eeb4446e80233865d6bfe542f387d395566cd4522f7c781f2e61b9f7233a1526e7b89d184d6277be4c9a55b579f4fadc5bc6764b28cb6c9f04437eb5393b94641a9be0bf3e3a2af58c6680858f991b301fb2", "ab0064030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8", "4de090f2"},
+	{255, 0, "617d1628c87500d39ed0c487db6ab84998288a66dc771b674c761e6fddff816a084d3d37a2a930f781db3f0471ece5f40e49ba52a6d7866dc211f0c06a28501b2c00aebfd1dfaf8a9d73eba86ab8387ddccf278070d73963adea59d4d88b56b8b55995da95b29b115509f2a720691c86373c30c800f8b804a3bf6ba82dd120035aac5640ee659bf2cd7fe48581fb2a3f2c2d2aa6161de5df37873f66c2e851789574ea903acba342a0dcd6f350bbd2ab9e6713edb5abd1d5ccc47d5dd0b30dd993206b9ff07195bab8b7d750f9523df65a518538b9e92b8076f4f9c7a9976d8277d507ae8b3ae43f5296f1af868193ac522618545328e5b01c7ba95644c87e969dbc", "ab00ff030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5", "351372e4"},
+	{255, 1, "1097d9acdf411221e3dd7d5385ae349e92946cfa6fed1b5eda2cb792c5cab81ac3611cf69ae3e23eed9e97f3daac2fa548df0c68303e7b63b0ee8cc5b119d8d60fca9f95e7016108ac312cc32fbd22f62b1f6c8862f993b7dc8e142057ec1cce19c244c8ef134f2467b13939a2ba84393ac20a987fc8fb61efe3d9bc0b214dc14532db3f5d502438a3856709782dcce959c35918728de300b6c6ae4fd95db61a5078fbb5dad5bc74bb60e7884360315b813b78933f7e927b93cdb660d9b6e0ff014f416f75dbc74e5457b4935f281b164592d6bf34dcedb4a9b8380ea449453c44f56546b6e64149bcfd1bf83aab1e84307ed6ac7c19c37391ed01ecadd058c80886", "ab00ff030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5", "aca23305"},
+	{255, 7, "3fdcb20ca60a354252a3e82f11dea748bde2278605b9a6f9edb62dd097949a0d64d05abb2615f02a71942da7dc961a13ffb665509174908bfc18d685b7870de8d87424d7a16a0a7d42973b598189d8cedba35d07d407c10758557c14abdd80674b3286152fc2b82a4b6e3a0b107fc241bc8e9570ee779b16df4b0b5ca2d5e5aa68e964c3afb6409eb405487b858b8fbd1afd36ec55c4d68acf81de76cd07a87ecc3298c40af6062258a2261ca25c1ecc6063e02eeb09ae1d4c652aaa23eb757a24aaf1a1babb283e7e12444bb596da67679cbbf66a12bd644ba49132deee7cb4ec22522320e5eb207bb4475c569767b67c2f490ec5f95f31ca0d314c4ae5684f1d47", "ab00ff030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dce3eaf1f8ff060d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6edf4fb020910171e252c333a41484f565d646b727980878e959ca3aab1b8bfc6cdd4dbe2e9f0f7fe050c131a21282f363d444b525960676e757c838a91989fa6adb4bbc2c9d0d7dee5ecf3fa01080f161d242b323940474e555c636a71787f868d949ba2a9b0b7bec5ccd3dae1e8eff6fd040b121920272e353c434a51585f666d747b828990979ea5acb3bac1c8cfd6dde4ebf2f900070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9e0e7eef5", "29ef1d85"},
+}
+
+@(test)
+test_shannon_matches_reference :: proc(t: ^testing.T) {
+	key: [32]byte
+	for i in 0 ..< 32 do key[i] = byte(i)
+
+	for v in SHANNON_VECTORS {
+		buf := make([]byte, 3 + v.n)
+		defer delete(buf)
+		buf[0] = 0xab
+		buf[1] = byte(v.n >> 8)
+		buf[2] = byte(v.n)
+		for i in 0 ..< v.n do buf[3 + i] = byte(i * 7 + 3)
+
+		c: Shannon
+		shannon_init(&c, key[:])
+		shannon_nonce_u32(&c, v.nonce)
+		shannon_encrypt(&c, buf)
+		mac: [4]byte
+		shannon_finish(&c, mac[:])
+
+		testing.expectf(t, hexs(buf) == v.cipher, "n=%d nonce=%d ciphertext %s != %s", v.n, v.nonce, hexs(buf), v.cipher)
+		testing.expectf(t, hexs(mac[:]) == v.mac, "n=%d nonce=%d mac %s != %s", v.n, v.nonce, hexs(mac[:]), v.mac)
+
+		// Decode the way the codec does: 3-byte header, then the payload.
+		d: Shannon
+		shannon_init(&d, key[:])
+		shannon_nonce_u32(&d, v.nonce)
+		shannon_decrypt(&d, buf[:3])
+		shannon_decrypt(&d, buf[3:])
+		dmac: [4]byte
+		shannon_finish(&d, dmac[:])
+
+		testing.expectf(t, hexs(buf) == v.plain, "n=%d nonce=%d plaintext %s != %s", v.n, v.nonce, hexs(buf), v.plain)
+		testing.expectf(t, hexs(dmac[:]) == v.mac, "n=%d nonce=%d decode mac %s != %s", v.n, v.nonce, hexs(dmac[:]), v.mac)
+	}
+}
+
+@(private = "file")
+hexs :: proc(b: []byte) -> string {
+	return string(hex.encode(b, context.temp_allocator))
+}
