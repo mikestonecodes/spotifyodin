@@ -21,13 +21,21 @@ init_track_profile :: proc() {
 Player :: struct {
 	session:       ^AP_Session,
 	client:        Client,
-	session_token: string,
 	out:           Audio_Out,
 	ready:         bool,
 	// Guards the access-point socket: one connection, shared by the worker and
 	// the preloader.
 	ap_mutex:      sync.Mutex,
 	pre:           Preloader,
+
+	// The session token, which expires after an hour, and the ones it
+	// replaced. Guarded separately from the socket because refreshing it must
+	// not queue behind a preload.
+	token_mutex:   sync.Mutex,
+	session_token: string,
+	stale_tokens:  [dynamic]string,
+	last_pump:     time.Time,
+	last_revive:   time.Time,
 
 	// What is playing, and the track before it. Keeping the previous buffer
 	// makes going back instant, which matters because nothing preloads
@@ -44,9 +52,9 @@ Player :: struct {
 // they are short — the download and decode, which are the slow part, run
 // outside the lock.
 Preloader :: struct {
+	owner:     ^Player,
 	session:   ^AP_Session,
 	ap_mutex:  ^sync.Mutex,
-	token:     string,
 	client:    Client,
 	mutex:     sync.Mutex,
 	want:      string, // uri the worker would like next
@@ -81,7 +89,7 @@ player_init :: proc(p: ^Player, c: Client) -> bool {
 	p.ready = true
 
 	p.pre.client = c
-	p.pre.token = strings.clone(session_token)
+	p.pre.owner = p
 	p.pre.session = session
 	p.pre.ap_mutex = &p.ap_mutex
 	p.pre.worker = thread.create_and_start_with_poly_data(&p.pre, preload_worker)
@@ -115,7 +123,7 @@ preload_worker :: proc(pre: ^Preloader) {
 			continue
 		}
 
-		audio, ok, _ := load_track_audio(pre.session, pre.ap_mutex, pre.token, uri)
+		audio, ok, _ := load_track_audio(pre.owner, uri)
 
 		sync.lock(&pre.mutex)
 		if ok && pre.want == uri {
@@ -147,9 +155,10 @@ player_destroy :: proc(p: ^Player) {
 	delete(p.pre.samples)
 	delete(p.pre.want)
 	delete(p.pre.ready_uri)
-	delete(p.pre.token)
 
 	delete(p.session_token)
+	for t in p.stale_tokens do delete(t)
+	delete(p.stale_tokens)
 	audio_out_destroy(&p.out)
 	if p.session != nil do ap_close(p.session)
 	p.ready = false
@@ -181,13 +190,19 @@ player_load :: proc(p: ^Player, uri: string) -> (ok: bool, permanent: bool) {
 			p.pre.samples = nil
 			delete(p.pre.ready_uri)
 			p.pre.ready_uri = ""
+			// Drop the request too. It is satisfied, and leaving it set sends
+			// the preloader straight back for a second copy of the track we
+			// are about to play — a wasted key request per skip, which is the
+			// very thing that gets the session throttled.
+			delete(p.pre.want)
+			p.pre.want = ""
 		}
 		sync.unlock(&p.pre.mutex)
 	}
 
 	// Nothing ready: fetch and decode, which takes a few seconds.
 	if samples == nil {
-		audio, loaded, hard := load_track_audio(p.session, &p.ap_mutex, p.session_token, uri)
+		audio, loaded, hard := load_track_audio(p, uri)
 		if !loaded do return false, hard
 		samples = audio.samples
 	}
@@ -201,6 +216,75 @@ player_load :: proc(p: ^Player, uri: string) -> (ok: bool, permanent: bool) {
 	p.prev_uri = p.current_uri
 	p.current_uri = strings.clone(uri)
 	return true, false
+}
+
+// The token the access point and spclient want. The one taken at startup lasts
+// about an hour; past that, storage-resolve answers 403 for every track in a
+// row, which looks exactly like the app having hung — and, until now, was only
+// cured by restarting it.
+player_token :: proc(p: ^Player) -> string {
+	sync.guard(&p.token_mutex)
+	if !token_expired(.Session) do return p.session_token
+
+	fresh, ok := get_access_token(.Session)
+	if !ok {
+		fmt.eprintln("could not refresh the session token")
+		return p.session_token
+	}
+	if fresh != p.session_token {
+		// The other thread may be part way through a request with the old
+		// token in hand, so retire it rather than freeing it under them.
+		append(&p.stale_tokens, p.session_token)
+		p.session_token = fresh
+	} else {
+		delete(fresh)
+	}
+	return p.session_token
+}
+
+// How often to look for packets the access point sent us unasked, and how long
+// to leave a dead connection alone between attempts to rebuild it.
+@(private = "file")
+PUMP_INTERVAL :: 2 * time.Second
+@(private = "file")
+REVIVE_INTERVAL :: 15 * time.Second
+
+// Answers the access point's keepalive ping. Call it from the worker loop: it
+// costs nothing when there is nothing to read, and skipping it is what gets
+// the connection dropped mid-album.
+player_keepalive :: proc(p: ^Player) {
+	if !p.ready || p.session == nil do return
+	if time.since(p.last_pump) < PUMP_INTERVAL do return
+	// Never wait for the socket here. This runs on the thread that services
+	// key presses, and a preload holding the lock must not delay a skip.
+	if !sync.try_lock(&p.ap_mutex) do return
+	p.last_pump = time.now()
+	alive := ap_pump(p.session)
+	sync.unlock(&p.ap_mutex)
+
+	// Rebuild it here rather than leaving it to the next skip, so the first
+	// thing the user asks for is not the thing that pays for the reconnect.
+	if !alive && time.since(p.last_revive) > REVIVE_INTERVAL {
+		p.last_revive = time.now()
+		player_revive(p)
+	}
+}
+
+// Whether the access point session is up. Read without the socket lock: it is
+// a single bool, and the answer is only used to word a status message.
+player_connected :: proc(p: ^Player) -> bool {
+	return p.ready && p.session != nil && p.session.connected
+}
+
+// Rebuilds the access-point session after it has dropped. Returns false when
+// there was nothing wrong with it, so an ordinary unavailable track does not
+// tear down a perfectly good connection.
+@(private = "file")
+player_revive :: proc(p: ^Player) -> bool {
+	sync.guard(&p.ap_mutex)
+	if p.session == nil || p.session.connected do return false
+	fmt.eprintln("access point connection dropped; reconnecting")
+	return ap_reconnect(p.session, player_token(p), device_id())
 }
 
 // Asks for one file's key, retrying a throttled refusal rather than giving up
@@ -236,19 +320,32 @@ request_key :: proc(
 	return key, false, true
 }
 
-// Resolves a track to playable samples over `session`. Tries Ogg files
-// best-quality-first, and falls through to the alternatives when Spotify will
-// not hand over a key for the original recording.
-load_track_audio :: proc(
-	session: ^AP_Session,
-	ap_mutex: ^sync.Mutex,
-	token: string,
+// Resolves a track to playable samples over the player's session, rebuilding
+// that session once if it turns out to have died. A dropped connection fails
+// every track identically, so without the retry the first one to hit it takes
+// the rest of the queue down with it.
+load_track_audio :: proc(p: ^Player, uri: string) -> (audio: Decoded_Audio, ok: bool, permanent: bool) {
+	audio, ok, permanent = try_load_track_audio(p, uri)
+	if ok || permanent do return audio, ok, permanent
+	if !player_revive(p) do return audio, ok, permanent
+	return try_load_track_audio(p, uri)
+}
+
+// Tries Ogg files best-quality-first, and falls through to the alternatives
+// when Spotify will not hand over a key for the original recording.
+@(private = "file")
+try_load_track_audio :: proc(
+	p: ^Player,
 	uri: string,
 ) -> (
 	audio: Decoded_Audio,
 	ok: bool,
 	permanent: bool,
 ) {
+	session := p.session
+	ap_mutex := &p.ap_mutex
+	token := player_token(p)
+
 	gid, gid_ok := track_gid(uri)
 	if !gid_ok do return {}, false, true
 	defer delete(gid)

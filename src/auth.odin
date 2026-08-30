@@ -101,6 +101,21 @@ load_tokens :: proc(kind := Token_Kind.Web_API) -> (t: Tokens, ok: bool) {
 	return t, t.access_token != ""
 }
 
+tokens_destroy :: proc(t: Tokens) {
+	delete(t.access_token)
+	delete(t.refresh_token)
+}
+
+// True when the stored token for `kind` is at or near expiry. Spotify tokens
+// last about an hour; nothing tells a long-running session that its own has
+// run out, the endpoints just start answering 403, so ask before using it.
+token_expired :: proc(kind := Token_Kind.Web_API) -> bool {
+	t, have := load_tokens(kind)
+	if !have do return true
+	defer tokens_destroy(t)
+	return time.now()._nsec / 1e9 >= t.expires_at - 60
+}
+
 // Returns a valid access token, refreshing or running the login flow as needed.
 get_access_token :: proc(kind := Token_Kind.Web_API) -> (token: string, ok: bool) {
 	id, scopes, redirect := token_settings(kind)

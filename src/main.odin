@@ -1,6 +1,7 @@
 package spoticyclint
 
 import "core:fmt"
+import "core:net"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -326,7 +327,67 @@ cmd_ap_login :: proc(c: Client) {
 				delete(f.gid)
 			}
 			delete(fs)
+
+			// What the player does between tracks: answer anything the access
+			// point sent us while we were busy.
+			if !ap_pump(session) {
+				fmt.println("  connection dropped")
+				return
+			}
 		}
+	}
+
+	// The failure this exists to catch: a track is several minutes long, and
+	// for most of that nothing reads the socket. The access point pings every
+	// minute or so and hangs up when the pings go unanswered, which used to
+	// leave the app unable to play anything until it was restarted.
+	// SPOTICYCLINT_IDLE_TEST=1 sits through one, and then asks for metadata to
+	// show the session is still good.
+	if os.get_env("SPOTICYCLINT_IDLE_TEST", context.temp_allocator) != "" {
+		fmt.println("idling 90s to let the access point ping us...")
+		for _ in 0 ..< 90 {
+			time.sleep(time.Second)
+			if !ap_pump(session) {
+				fmt.println("  the access point hung up during the idle")
+				os.exit(1)
+			}
+		}
+		fs, fs_ok := ap_track_files(session, gid)
+		if !fs_ok {
+			fmt.println("  session is unusable after idling")
+			os.exit(1)
+		}
+		for f in fs {
+			delete(f.file_id)
+			delete(f.gid)
+		}
+		delete(fs)
+		fmt.println("session still good after idling")
+	}
+
+	// The other half of the same failure: when the access point does hang up,
+	// the session has to come back on its own. SPOTICYCLINT_RECONNECT_TEST=1
+	// pulls the socket out from under it and checks that it does.
+	if os.get_env("SPOTICYCLINT_RECONNECT_TEST", context.temp_allocator) != "" {
+		fmt.println("dropping the connection on purpose...")
+		net.close(session.socket)
+		session.connected = false
+
+		if !ap_reconnect(session, session_token, device_id()) {
+			fmt.println("  could not rebuild the session")
+			os.exit(1)
+		}
+		fs, fs_ok := ap_track_files(session, gid)
+		if !fs_ok {
+			fmt.println("  rebuilt session cannot fetch metadata")
+			os.exit(1)
+		}
+		for f in fs {
+			delete(f.file_id)
+			delete(f.gid)
+		}
+		delete(fs)
+		fmt.printfln("reconnected as %q and still playing", session.username)
 	}
 }
 

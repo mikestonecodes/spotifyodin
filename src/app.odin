@@ -1120,6 +1120,11 @@ on_load_progress :: proc(done, total: int, user: rawptr) {
 	set_status(cast(^Shared)user, fmt.tprintf("loading %d / %d songs...", done, total))
 }
 
+// How many loads may fail for reasons other than the track before the worker
+// stops advancing on its own and waits for the user.
+@(private = "file")
+MAX_STALLED_LOADS :: 4
+
 // The worker owns the library, the shuffle and the player. It never touches
 // the GPU and the UI thread never makes a network call, so neither can stall
 // the other.
@@ -1199,7 +1204,14 @@ worker_main :: proc(app: ^App) {
 	sync.unlock(&s.mutex)
 
 	index := -1
+	// What is actually coming out of the speakers. `index` is the last track
+	// we tried, which is a different thing the moment a load fails.
+	playing := -1
 	load_index := 0 // < 0 means "nothing to load"
+	// Consecutive loads that failed for a reason that was not the track's
+	// fault. Once the access point starts throttling key requests, every load
+	// fails and auto-advancing just asks for more of them.
+	stalled := 0
 
 	for {
 		sync.lock(&s.mutex)
@@ -1215,6 +1227,18 @@ worker_main :: proc(app: ^App) {
 
 		if quit do return
 
+		// Answer the access point's keepalive. Nothing else reads the socket
+		// while a track plays, and an unanswered ping gets us hung up on —
+		// after which every load fails until the app is restarted.
+		player_keepalive(player)
+
+		// A key press after we gave up buys one more attempt, not a fresh run
+		// of them: if the session is still throttled, one failed load is
+		// enough to know, and four more just walk the queue for nothing.
+		if len(cmds) > 0 || play_index >= 0 {
+			stalled = min(stalled, MAX_STALLED_LOADS - 1)
+		}
+
 		for cmd in cmds {
 			switch cmd {
 			case .None:
@@ -1222,8 +1246,15 @@ worker_main :: proc(app: ^App) {
 				if index < 0 do load_index = 0
 				else do player_toggle(player)
 			case .Next:
-				load_index = index + 1
+				// Relative to what is already queued, not to what finished
+				// loading: a burst of presses while a track loads should move
+				// that many tracks, not one.
+				load_index = (load_index >= 0 ? load_index : index) + 1
 			case .Previous:
+				if load_index >= 0 {
+					load_index -= 1
+					break
+				}
 				// Restart the track first, like every other player.
 				pos := player_position(player)
 				if pos.position_ms > 3000 do player_seek(player, 0)
@@ -1248,10 +1279,9 @@ worker_main :: proc(app: ^App) {
 		if player_track_ended(player) && load_index < 0 do load_index = index + 1
 
 		if load_index >= 0 {
-			next := load_index
+			// Wrap, however far past either end the skips ran.
+			next := ((load_index % len(order)) + len(order)) % len(order)
 			load_index = -1
-			if next >= len(order) do next = 0
-			if next < 0 do next = len(order) - 1
 
 			// Show the selection straight away. A preloaded track is ready in
 			// a moment, and an un-preloaded one takes a second or so — either
@@ -1262,6 +1292,8 @@ worker_main :: proc(app: ^App) {
 			loaded, permanent := player_load(player, order[next].uri)
 			if loaded {
 				index = next
+				playing = next
+				stalled = 0
 				sync.lock(&s.mutex)
 				s.is_playing = true
 				sync.unlock(&s.mutex)
@@ -1281,12 +1313,34 @@ worker_main :: proc(app: ^App) {
 					fmt.eprintfln("could not play %s - %s", order[next].artist, order[next].name)
 				}
 
-				// Skip past it, but slowly: a non-permanent failure is usually
-				// Spotify throttling key requests, and racing ahead just asks
-				// for more of them.
 				index = next
-				load_index = next + 1
-				if worker_sleep(s, permanent ? 0 : 2) do return
+				if !permanent do stalled += 1
+
+				// Give up on advancing by ourselves once the failures stop
+				// looking like bad tracks: walking the whole queue two seconds
+				// at a time keeps the session throttled and leaves every key
+				// press queued behind a load that cannot succeed.
+				if stalled >= MAX_STALLED_LOADS {
+					// Say which of the two it is. They look identical from
+					// here and call for different patience: throttling passes
+					// on its own, a dead connection needs one to come back.
+					if player_connected(player) {
+						set_status(s, "Spotify is throttling playback; press next to retry", true)
+					} else {
+						set_status(s, "lost the connection to Spotify; press next to retry", true)
+					}
+					fmt.eprintln("giving up auto-advance after repeated failed loads")
+					// Put the cover back on the track still playing. Leaving
+					// the one that failed on screen says the skip worked when
+					// the audio never moved.
+					if playing >= 0 do publish_track(s, order[playing])
+				} else {
+					// Skip past it, but slowly: a non-permanent failure is
+					// usually Spotify throttling key requests, and racing
+					// ahead just asks for more of them.
+					load_index = next + 1
+					if worker_sleep(s, permanent ? 0 : 2) do return
+				}
 			}
 		}
 

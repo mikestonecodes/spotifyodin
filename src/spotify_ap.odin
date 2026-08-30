@@ -139,6 +139,14 @@ ap_connect :: proc(access_token: string, device_id: string) -> (s: ^AP_Session, 
 			continue
 		}
 
+		// Without a timeout, an access point that stops talking without
+		// closing the connection parks the worker inside recv() for ever,
+		// holding the socket lock — every skip and every preload queues up
+		// behind it and the app is simply dead until it is restarted.
+		io_timeout := AP_IO_TIMEOUT
+		_ = net.set_option(socket, .Receive_Timeout, io_timeout)
+		_ = net.set_option(socket, .Send_Timeout, io_timeout)
+
 		session := new(AP_Session)
 		session.socket = socket
 		if !ap_handshake(session) {
@@ -168,6 +176,31 @@ ap_close :: proc(s: ^AP_Session) {
 	for k in s.key_cache do delete(k)
 	delete(s.key_cache)
 	free(s)
+}
+
+// Rebuilds a dropped session in the same allocation. In place matters: the
+// preloader holds this very pointer, so handing back a new session would leave
+// it talking to a closed socket.
+ap_reconnect :: proc(s: ^AP_Session, access_token: string, device_id: string) -> bool {
+	if s == nil do return false
+	net.close(s.socket)
+	s.connected = false
+
+	fresh, ok := ap_connect(access_token, device_id)
+	if !ok do return false
+
+	// Keep the audio keys. They do not belong to the connection, and every one
+	// of them is a request we do not have to make again on a session that has
+	// already shown it can be throttled.
+	keys := s.key_cache
+	s.key_cache = nil
+	delete(s.username)
+
+	s^ = fresh^
+	delete(s.key_cache)
+	s.key_cache = keys
+	free(fresh)
+	return true
 }
 
 // ---------------------------------------------------------------- handshake
@@ -206,7 +239,7 @@ ap_handshake :: proc(s: ^AP_Session) -> bool {
 
 	// Response: 4-byte big-endian length covering the length field itself.
 	size_buf: [4]byte
-	if !recv_exact(s.socket, size_buf[:]) do return false
+	if ok, _ := recv_exact(s.socket, size_buf[:]); !ok do return false
 	append(&accumulator, ..size_buf[:])
 
 	size, _ := endian.get_u32(size_buf[:], .Big)
@@ -214,7 +247,7 @@ ap_handshake :: proc(s: ^AP_Session) -> bool {
 
 	response := make([]byte, int(size) - 4)
 	defer delete(response)
-	if !recv_exact(s.socket, response) do return false
+	if ok, _ := recv_exact(s.socket, response); !ok do return false
 	append(&accumulator, ..response)
 
 	// APResponseMessage.challenge.login_crypto_challenge.diffie_hellman
@@ -466,6 +499,11 @@ ap_login_error :: proc(code: int) -> string {
 
 // Each packet is [cmd][u16 length][payload] encrypted under a per-packet nonce
 // that is simply the packet counter, followed by a 4-byte MAC.
+// How long a single packet may take before the connection counts as gone, and
+// how long the keepalive poll waits to find out that nothing is pending.
+AP_IO_TIMEOUT: time.Duration : 15 * time.Second
+AP_POLL_TIMEOUT: time.Duration : 20 * time.Millisecond
+
 ap_send :: proc(s: ^AP_Session, cmd: byte, payload: []byte) -> bool {
 	frame := make([]byte, 3 + len(payload) + 4, context.temp_allocator)
 	frame[0] = cmd
@@ -477,24 +515,60 @@ ap_send :: proc(s: ^AP_Session, cmd: byte, payload: []byte) -> bool {
 
 	shannon_encrypt(&s.send_cipher, frame[:3 + len(payload)])
 	shannon_finish(&s.send_cipher, frame[3 + len(payload):])
-	return send_all(s.socket, frame)
+	if !send_all(s.socket, frame) {
+		s.connected = false
+		return false
+	}
+	return true
 }
 
 ap_recv :: proc(s: ^AP_Session) -> (cmd: byte, payload: []byte, ok: bool) {
+	c, data, state := ap_recv_packet(s, wait = true)
+	return c, data, state == .Packet
+}
+
+Recv_State :: enum {
+	Packet, // one decoded packet
+	Idle, // nothing pending; only possible when not waiting
+	Dead, // the connection is gone
+}
+
+// The one place packets are decoded. `wait` false makes it a poll: it looks
+// for a packet already on the wire and reports .Idle rather than blocking.
+@(private = "file")
+ap_recv_packet :: proc(s: ^AP_Session, wait: bool) -> (cmd: byte, payload: []byte, state: Recv_State) {
+	header: [3]byte
+
+	// Peek before touching the cipher. Setting the nonce is destructive, and a
+	// poll that finds nothing must leave the stream exactly as it was so the
+	// next real read still decodes.
+	if !wait {
+		poll := AP_POLL_TIMEOUT
+		_ = net.set_option(s.socket, .Receive_Timeout, poll)
+	}
+	got, idle := recv_exact(s.socket, header[:])
+	if !wait {
+		io_timeout := AP_IO_TIMEOUT
+		_ = net.set_option(s.socket, .Receive_Timeout, io_timeout)
+	}
+	if !got {
+		if idle && !wait do return 0, nil, .Idle
+		s.connected = false
+		return 0, nil, .Dead
+	}
+
 	shannon_nonce_u32(&s.recv_cipher, s.recv_nonce)
 	s.recv_nonce += 1
-
-	header: [3]byte
-	if !recv_exact(s.socket, header[:]) do return 0, nil, false
 	shannon_decrypt(&s.recv_cipher, header[:])
 
 	cmd = header[0]
 	size, _ := endian.get_u16(header[1:3], .Big)
 
 	body := make([]byte, int(size) + 4)
-	if !recv_exact(s.socket, body) {
+	if body_ok, _ := recv_exact(s.socket, body); !body_ok {
 		delete(body)
-		return 0, nil, false
+		s.connected = false
+		return 0, nil, .Dead
 	}
 	shannon_decrypt(&s.recv_cipher, body[:size])
 
@@ -503,13 +577,38 @@ ap_recv :: proc(s: ^AP_Session) -> (cmd: byte, payload: []byte, ok: bool) {
 	if !bytes.equal(expected[:], body[size:]) {
 		delete(body)
 		fmt.eprintln("access point packet failed its MAC check")
-		return 0, nil, false
+		// The keystream is past the point of recovery, so nothing that follows
+		// will decode either. Say so, and let the caller build a new session.
+		s.connected = false
+		return 0, nil, .Dead
 	}
 
 	payload = make([]byte, int(size))
 	copy(payload, body[:size])
 	delete(body)
-	return cmd, payload, true
+	return cmd, payload, .Packet
+}
+
+// Reads whatever the access point has sent us unprompted — in practice its
+// keepalive ping, which it expects answered within a minute or so. Nothing
+// else here touches the socket between requests, so on a long track the pings
+// pile up unanswered, the access point hangs up, and every load from then on
+// fails against a socket nobody ever rebuilds. That is the hang that a restart
+// "fixed". Returns false once the connection is gone.
+ap_pump :: proc(s: ^AP_Session) -> bool {
+	if s == nil || !s.connected do return false
+	for {
+		cmd, payload, state := ap_recv_packet(s, wait = false)
+		switch state {
+		case .Idle:
+			return true
+		case .Dead:
+			return false
+		case .Packet:
+			if cmd == PACKET_PING do ap_send(s, PACKET_PONG, payload)
+			delete(payload)
+		}
+	}
 }
 
 // ------------------------------------------------------------------- plumbing
@@ -525,15 +624,25 @@ send_all :: proc(socket: net.TCP_Socket, data: []byte) -> bool {
 	return true
 }
 
+// Reads exactly len(buf) bytes. `idle` separates "the peer has not sent
+// anything yet" from a broken connection, which is what lets the keepalive
+// poll ask without committing: once a single byte has arrived we are mid
+// packet and have to see it through, timeout or not, or the stream desyncs.
 @(private = "file")
-recv_exact :: proc(socket: net.TCP_Socket, buf: []byte) -> bool {
+recv_exact :: proc(socket: net.TCP_Socket, buf: []byte) -> (ok: bool, idle: bool) {
+	deadline := time.time_add(time.now(), AP_IO_TIMEOUT)
 	got := 0
 	for got < len(buf) {
 		n, err := net.recv_tcp(socket, buf[got:])
-		if err != nil || n <= 0 do return false
+		if err == .Timeout || err == .Would_Block || err == .Interrupted {
+			if got == 0 && err != .Interrupted do return false, true
+			if time.since(deadline) > 0 do return false, false
+			continue
+		}
+		if err != nil || n <= 0 do return false, false
 		got += n
 	}
-	return true
+	return true, false
 }
 
 @(private = "file")
@@ -575,6 +684,8 @@ mercury_response_destroy :: proc(r: Mercury_Response) {
 }
 
 ap_mercury_get :: proc(s: ^AP_Session, uri: string) -> (resp: Mercury_Response, ok: bool) {
+	if !s.connected do return {}, false
+
 	header: Pb
 	defer pb_destroy(&header)
 	pb_str(&header, 1, uri)
@@ -887,11 +998,18 @@ PACKET_AES_KEY_ERROR :: 0x0e
 KEY_MIN_INTERVAL :: 400 * time.Millisecond
 KEY_BACKOFF_STEP :: 400 * time.Millisecond
 KEY_BACKOFF_MAX :: 4 * time.Second
+// Idle time after which the accumulated backoff is forgotten.
+KEY_BACKOFF_RESET :: 30 * time.Second
 
 // How long to wait before the next key request. The caller does the waiting,
 // because it holds the socket lock and sleeping under it would stall anything
 // the user asked for behind a preload that happens to be backing off.
 ap_key_wait :: proc(s: ^AP_Session) -> time.Duration {
+	// A quiet stretch is the throttling clearing itself: keep the backoff from
+	// outliving the burst that earned it, or one bad minute of skipping makes
+	// every later request slow.
+	if s.refusals > 0 && time.since(s.last_key) > KEY_BACKOFF_RESET do s.refusals = 0
+
 	wait := KEY_MIN_INTERVAL
 	if s.refusals > 0 {
 		wait += min(KEY_BACKOFF_STEP * time.Duration(s.refusals), KEY_BACKOFF_MAX)
@@ -917,6 +1035,9 @@ ap_audio_key :: proc(
 	// Keys do not change, so a track played twice costs one request.
 	cache_key := to_hex_string(file_id, context.temp_allocator)
 	if cached, hit := s.key_cache[cache_key]; hit do return cached, true, false
+
+	// A dead session refuses everything, and that is not the track's fault.
+	if !s.connected do return key, false, true
 
 	s.last_key = time.now()
 
