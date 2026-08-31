@@ -113,6 +113,10 @@ App :: struct {
 	shift:        f32,
 	shift_by:     int,
 
+	// How long this frame has already spent turning cached covers into
+	// textures on the UI thread. See ART_SYNC_BUDGET_MS.
+	art_sync_ms:  f64,
+
 	// The cover growing out of the grid into the feature slot. `grow` runs
 	// 1 -> 0 across it.
 	grow:         f32,
@@ -211,6 +215,7 @@ run_ui :: proc(client: Client, device: string) {
 			needs_draw = true
 		}
 		art_start := time.now()
+		app.art_sync_ms = 0
 		if upload_pending_art(app) do needs_draw = true
 		prof_art_ns += time.duration_milliseconds(time.since(art_start))
 		if window_has_input(&app.win) do needs_draw = true
@@ -964,6 +969,7 @@ want_art :: proc(app: ^App, url: string) {
 	if url == "" do return
 	if bindless_full(&app.gpu) do return
 	if _, have := app.art[url]; have do return
+	if art_from_cache(app, url) do return
 
 	sync.guard(&app.shared.mutex)
 	if app.shared.art_inflight[url] do return
@@ -999,6 +1005,7 @@ want_feature_art :: proc(app: ^App, url: string) {
 	if url == "" || url == app.feature_url do return
 	delete(app.feature_url)
 	app.feature_url = strings.clone(url)
+	if feature_from_cache(app, url) do return
 
 	sync.guard(&app.shared.mutex)
 	append(&app.shared.art_wanted, Art_Request{strings.clone(url), ART_FEATURE_PX, true})
@@ -1016,6 +1023,57 @@ ART_TEXTURE_PX :: 224
 // slot at full size, replaced in place each track rather than adding an entry
 // per song.
 ART_FEATURE_PX :: 640
+
+// A cover that is already on disk needs no fetch, so it does not belong on the
+// art thread's queue at all: waiting a turn there, then a turn in the
+// four-per-frame upload drip, is how a cached grid ended up fading in as if it
+// were downloading. Read, decode and upload it right here instead and the tile
+// is drawn with its cover on the very frame it was asked for.
+//
+// Decoding is a millisecond or so each, so a first frame that asks for a whole
+// screenful still has to be capped — past the budget the rest fall back to the
+// queue and arrive over the next couple of frames.
+@(private = "file")
+ART_SYNC_BUDGET_MS :: 6.0
+
+@(private = "file")
+art_from_cache :: proc(app: ^App, url: string) -> bool {
+	if app.art_sync_ms >= ART_SYNC_BUDGET_MS do return false
+	start := time.now()
+	defer app.art_sync_ms += time.duration_milliseconds(time.since(start))
+
+	body, cached := load_art(url)
+	if !cached do return false
+	defer delete(body)
+
+	pixels, w, h, ok := decode_art(body, ART_TEXTURE_PX)
+	if !ok do return false
+	defer delete(pixels)
+
+	app.art[strings.clone(url)] = texture_upload(&app.gpu, pixels, w, h, 4)
+	return true
+}
+
+@(private = "file")
+feature_from_cache :: proc(app: ^App, url: string) -> bool {
+	body, cached := load_art(url)
+	if !cached do return false
+	defer delete(body)
+
+	pixels, w, h, ok := decode_art(body, ART_FEATURE_PX)
+	if !ok do return false
+	defer delete(pixels)
+
+	if !app.feature_ready {
+		app.feature_slot = texture_upload(&app.gpu, pixels, w, h, 4)
+		app.feature_ready = true
+	} else {
+		texture_replace(&app.gpu, app.feature_slot, pixels, w, h, 4)
+	}
+	delete(app.feature_shown)
+	app.feature_shown = strings.clone(url)
+	return true
+}
 
 @(private = "file")
 upload_pending_art :: proc(app: ^App) -> (uploaded: bool) {
@@ -1448,7 +1506,9 @@ fetch_art :: proc(s: ^Shared, req: Art_Request) {
 	url := req.url
 
 	// The disk cache holds the cover exactly as the CDN sent it, so a restart
-	// redraws the grid without touching the network.
+	// redraws the grid without touching the network. Anything already cached
+	// is normally taken on the UI thread; this path is what is left over when
+	// a frame ran out of its decode budget.
 	body, cached := load_art(url)
 	if !cached {
 		res, ok := http_request("GET", url, nil)
@@ -1461,50 +1521,8 @@ fetch_art :: proc(s: ^Shared, req: Art_Request) {
 	}
 	defer delete(body)
 
-	w, h, ch: i32
-	pixels := stbi.load_from_memory(raw_data(body), i32(len(body)), &w, &h, &ch, 4)
-	if pixels == nil do return
-
-	// Covers arrive at 300px but a tile is nowhere near that on screen, and
-	// every slot in the bindless table costs VRAM for as long as it lives.
-	// Downscaling here keeps the whole table affordable.
-	// Whatever leaves here must be Odin-allocated: the caller frees it with
-	// delete, and stb_image's buffer came from malloc. The feature cover is
-	// requested at exactly its source size, so the resize path below does not
-	// always run.
-	out_w, out_h := int(w), int(h)
-	data: []byte
-	if max(out_w, out_h) <= req.max_px {
-		data = make([]byte, out_w * out_h * 4)
-		copy(data, pixels[:out_w * out_h * 4])
-		stbi.image_free(pixels)
-	}
-	if data == nil {
-		scale := f32(req.max_px) / f32(max(out_w, out_h))
-		nw := max(int(f32(out_w) * scale), 1)
-		nh := max(int(f32(out_h) * scale), 1)
-		small := make([]byte, nw * nh * 4)
-		ok := stbi.resize_uint8_srgb(
-			pixels,
-			w,
-			h,
-			0,
-			raw_data(small),
-			i32(nw),
-			i32(nh),
-			0,
-			4,
-			3, // alpha channel index
-			0,
-		)
-		stbi.image_free(pixels)
-		if ok == 0 {
-			delete(small)
-			return
-		}
-		data = small
-		out_w, out_h = nw, nh
-	}
+	data, out_w, out_h, ok := decode_art(body, req.max_px)
+	if !ok do return
 
 	sync.guard(&s.mutex)
 	append(
@@ -1517,6 +1535,53 @@ fetch_art :: proc(s: ^Shared, req: Art_Request) {
 			feature = req.feature,
 		},
 	)
+}
+
+// Encoded cover bytes in, texture-ready pixels out. Whatever leaves here must
+// be Odin-allocated: the caller frees it with delete, and stb_image's buffer
+// came from malloc.
+@(private = "file")
+decode_art :: proc(body: []byte, max_px: int) -> (data: []byte, out_w, out_h: int, ok: bool) {
+	w, h, ch: i32
+	pixels := stbi.load_from_memory(raw_data(body), i32(len(body)), &w, &h, &ch, 4)
+	if pixels == nil do return nil, 0, 0, false
+
+	// Covers arrive at 300px but a tile is nowhere near that on screen, and
+	// every slot in the bindless table costs VRAM for as long as it lives.
+	// Downscaling here keeps the whole table affordable. The feature cover is
+	// requested at exactly its source size, so the resize path does not always
+	// run.
+	out_w, out_h = int(w), int(h)
+	if max(out_w, out_h) <= max_px {
+		data = make([]byte, out_w * out_h * 4)
+		copy(data, pixels[:out_w * out_h * 4])
+		stbi.image_free(pixels)
+		return data, out_w, out_h, true
+	}
+
+	scale := f32(max_px) / f32(max(out_w, out_h))
+	nw := max(int(f32(out_w) * scale), 1)
+	nh := max(int(f32(out_h) * scale), 1)
+	small := make([]byte, nw * nh * 4)
+	resized := stbi.resize_uint8_srgb(
+		pixels,
+		w,
+		h,
+		0,
+		raw_data(small),
+		i32(nw),
+		i32(nh),
+		0,
+		4,
+		3, // alpha channel index
+		0,
+	)
+	stbi.image_free(pixels)
+	if resized == 0 {
+		delete(small)
+		return nil, 0, 0, false
+	}
+	return small, nw, nh, true
 }
 
 // Takes a copy: `text` is usually a temp-allocated format result, and the
