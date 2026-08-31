@@ -1088,9 +1088,32 @@ load_or_fetch_library :: proc(c: Client, s: ^Shared) -> ([dynamic]Track, bool) {
 		set_status(s, fmt.tprintf("%d songs", len(tracks)))
 		return tracks, true
 	}
+	// A stale cache is revalidated rather than thrown away. Listing the liked
+	// tracks is one request and everything already described is kept, so the
+	// day-old case costs a couple of requests instead of a full refill.
 	if hit {
-		for t in tracks do free_track(t)
-		clear(&tracks)
+		if session_token, have := get_access_token(.Session); have {
+			defer delete(session_token)
+			set_status(s, "checking for new songs...")
+			refreshed, ref_ok := refresh_library_spclient(
+				session_token,
+				tracks[:],
+				on_load_progress,
+				s,
+			)
+			if ref_ok {
+				for t in tracks do free_track(t)
+				delete(tracks)
+				save_library(refreshed[:], true)
+				set_status(s, fmt.tprintf("%d songs", len(refreshed)))
+				return refreshed, true
+			}
+			delete(refreshed)
+		}
+		// Nothing answered, so play from what we have; the next start tries
+		// again. An out-of-date library beats an empty one.
+		set_status(s, fmt.tprintf("%d songs", len(tracks)))
+		return tracks, true
 	}
 
 	set_status(s, "loading liked songs...")
@@ -1423,15 +1446,23 @@ art_worker :: proc(s: ^Shared) {
 @(private = "file")
 fetch_art :: proc(s: ^Shared, req: Art_Request) {
 	url := req.url
-	res, ok := http_request("GET", url, nil)
-	if !ok || res.status != 200 {
-		delete(res.body)
-		return
+
+	// The disk cache holds the cover exactly as the CDN sent it, so a restart
+	// redraws the grid without touching the network.
+	body, cached := load_art(url)
+	if !cached {
+		res, ok := http_request("GET", url, nil)
+		if !ok || res.status != 200 {
+			delete(res.body)
+			return
+		}
+		body = transmute([]byte)res.body
+		save_art(url, body)
 	}
-	defer delete(res.body)
+	defer delete(body)
 
 	w, h, ch: i32
-	pixels := stbi.load_from_memory(raw_data(res.body), i32(len(res.body)), &w, &h, &ch, 4)
+	pixels := stbi.load_from_memory(raw_data(body), i32(len(body)), &w, &h, &ch, 4)
 	if pixels == nil do return
 
 	// Covers arrive at 300px but a tile is nowhere near that on screen, and

@@ -71,6 +71,51 @@ load_library :: proc() -> (tracks: [dynamic]Track, complete: bool, ok: bool) {
 	return tracks, cached.complete && fresh, true
 }
 
+// Cover art is content addressed: the id at the end of the URL *is* the image,
+// so a cover that has been downloaded once never goes stale. Keeping the
+// encoded bytes means scrolling the grid a second time costs no network at
+// all, and a cover is a few tens of kilobytes on disk.
+@(private = "file")
+art_cache_path :: proc(url: string) -> string {
+	id := url
+	if i := strings.last_index_byte(url, '/'); i >= 0 do id = url[i + 1:]
+	if id == "" do return ""
+	// Only the plain hex ids get a file; anything else stays uncached rather
+	// than deciding where in the filesystem to write.
+	for ch in id {
+		switch ch {
+		case '0' ..= '9', 'a' ..= 'z', 'A' ..= 'Z':
+		case:
+			return ""
+		}
+	}
+
+	dir := cache_dir()
+	defer delete(dir)
+	return fmt.tprintf("%s/art/%s", dir, id)
+}
+
+load_art :: proc(url: string) -> ([]byte, bool) {
+	path := art_cache_path(url)
+	if path == "" do return nil, false
+	data, err := os.read_entire_file_from_path(path, context.allocator)
+	if err != nil || len(data) == 0 {
+		delete(data)
+		return nil, false
+	}
+	return data, true
+}
+
+save_art :: proc(url: string, data: []byte) {
+	path := art_cache_path(url)
+	if path == "" || len(data) == 0 do return
+
+	dir := cache_dir()
+	defer delete(dir)
+	os.make_directory_all(fmt.tprintf("%s/art", dir))
+	_ = os.write_entire_file(path, data)
+}
+
 // A stable per-install device id, as the access point expects. librespot uses
 // 40 hex characters; anything stable of that shape works.
 device_id :: proc() -> string {

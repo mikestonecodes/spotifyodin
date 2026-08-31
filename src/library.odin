@@ -24,6 +24,7 @@ Meta_Job :: struct {
 	host:     string,
 	uris:     []string,
 	tracks:   []Track,
+	todo:     []int, // indices into uris still needing a metadata call
 	mutex:    sync.Mutex,
 	next:     int,
 	done:     int,
@@ -50,18 +51,78 @@ fetch_library_spclient :: proc(
 	}
 	if !uris_ok || len(uris) == 0 do return tracks, false
 
+	todo := make([]int, len(uris), context.temp_allocator)
+	for i in 0 ..< len(uris) do todo[i] = i
+	return describe_tracks(session_token, host, uris[:], nil, todo, progress, user)
+}
+
+// Brings a cached library up to date instead of refetching it. The liked list
+// is a single request, and a track already in the cache describes itself, so
+// only songs liked since the cache was written cost a metadata call — a day
+// old library is usually two requests rather than several thousand.
+//
+// `cached` stays owned by the caller: every track here is a fresh copy.
+refresh_library_spclient :: proc(
+	session_token: string,
+	cached: []Track,
+	progress: Progress = nil,
+	user: rawptr = nil,
+) -> (
+	tracks: [dynamic]Track,
+	ok: bool,
+) {
+	host := spclient_host()
+
+	uris, uris_ok := liked_track_uris(session_token, host)
+	defer {
+		for u in uris do delete(u)
+		delete(uris)
+	}
+	if !uris_ok || len(uris) == 0 do return tracks, false
+
+	known := make(map[string]Track, len(cached), context.temp_allocator)
+	defer delete(known)
+	for t in cached do known[t.uri] = t
+
+	todo := make([dynamic]int, 0, len(uris), context.temp_allocator)
+	for uri, i in uris {
+		if _, have := known[uri]; !have do append(&todo, i)
+	}
+
+	return describe_tracks(session_token, host, uris[:], known, todo[:], progress, user)
+}
+
+// Fills in the tracks named by `uris`, reusing anything `known` already
+// describes and asking the metadata endpoint for the rest.
+@(private = "file")
+describe_tracks :: proc(
+	session_token, host: string,
+	uris: []string,
+	known: map[string]Track,
+	todo: []int,
+	progress: Progress,
+	user: rawptr,
+) -> (
+	tracks: [dynamic]Track,
+	ok: bool,
+) {
 	job := Meta_Job {
 		token    = session_token,
 		host     = host,
-		uris     = uris[:],
+		uris     = uris,
 		tracks   = make([]Track, len(uris)),
+		todo     = todo,
 		progress = progress,
 		user     = user,
 	}
 	defer delete(job.tracks)
 
+	for uri, i in uris {
+		if t, have := known[uri]; have do job.tracks[i] = clone_track(t)
+	}
+
 	threads: [METADATA_WORKERS]^thread.Thread
-	n := min(METADATA_WORKERS, len(uris))
+	n := min(METADATA_WORKERS, len(todo))
 	for i in 0 ..< n do threads[i] = thread.create_and_start_with_poly_data(&job, metadata_worker)
 	for i in 0 ..< n {
 		thread.join(threads[i])
@@ -114,11 +175,11 @@ liked_track_uris :: proc(token: string, host: string) -> (uris: [dynamic]string,
 metadata_worker :: proc(job: ^Meta_Job) {
 	for {
 		sync.lock(&job.mutex)
-		if job.next >= len(job.uris) {
+		if job.next >= len(job.todo) {
 			sync.unlock(&job.mutex)
 			return
 		}
-		index := job.next
+		index := job.todo[job.next]
 		job.next += 1
 		sync.unlock(&job.mutex)
 
@@ -128,7 +189,7 @@ metadata_worker :: proc(job: ^Meta_Job) {
 
 		sync.lock(&job.mutex)
 		job.done += 1
-		done, total, progress, user := job.done, len(job.uris), job.progress, job.user
+		done, total, progress, user := job.done, len(job.todo), job.progress, job.user
 		sync.unlock(&job.mutex)
 		if progress != nil do progress(done, total, user)
 

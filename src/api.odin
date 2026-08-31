@@ -176,6 +176,19 @@ fetch_page :: proc(
 	return tracks, total, true
 }
 
+// Used when a cached library is refreshed in place: the copy is owned by the
+// new list, the original still by the cache it came from.
+clone_track :: proc(t: Track) -> Track {
+	return Track {
+		uri = strings.clone(t.uri),
+		name = strings.clone(t.name),
+		artist = strings.clone(t.artist),
+		artist_id = strings.clone(t.artist_id),
+		art_url = strings.clone(t.art_url),
+		art_url_big = strings.clone(t.art_url_big),
+	}
+}
+
 free_track :: proc(t: Track) {
 	delete(t.art_url_big)
 	delete(t.uri)
