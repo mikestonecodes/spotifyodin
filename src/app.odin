@@ -84,6 +84,7 @@ Shared :: struct {
 	art_wanted:   [dynamic]Art_Request,
 	art_ready:    [dynamic]Art,
 	art_inflight: map[string]bool,
+	art_wake:     sync.Sema,
 }
 
 App :: struct {
@@ -95,7 +96,7 @@ App :: struct {
 	scroll:  Scroll,
 	art:     map[string]u32,
 	worker:  ^thread.Thread,
-	art_thread: ^thread.Thread,
+	art_threads: [ART_THREADS]^thread.Thread,
 
 	saved_volume: f32,
 
@@ -112,10 +113,6 @@ App :: struct {
 	// `shift_by` is how many slots the queue moved.
 	shift:        f32,
 	shift_by:     int,
-
-	// How long this frame has already spent turning cached covers into
-	// textures on the UI thread. See ART_SYNC_BUDGET_MS.
-	art_sync_ms:  f64,
 
 	// The cover growing out of the grid into the feature slot. `grow` runs
 	// 1 -> 0 across it.
@@ -177,7 +174,9 @@ run_ui :: proc(client: Client, device: string) {
 	defer ui_destroy(&app.ui)
 
 	app.worker = thread.create_and_start_with_poly_data(app, worker_main)
-	app.art_thread = thread.create_and_start_with_poly_data(&app.shared, art_worker)
+	for i in 0 ..< ART_THREADS {
+		app.art_threads[i] = thread.create_and_start_with_poly_data(&app.shared, art_worker)
+	}
 
 	last_frame := time.now()
 	last_draw := time.now()
@@ -215,7 +214,6 @@ run_ui :: proc(client: Client, device: string) {
 			needs_draw = true
 		}
 		art_start := time.now()
-		app.art_sync_ms = 0
 		if upload_pending_art(app) do needs_draw = true
 		prof_art_ns += time.duration_milliseconds(time.since(art_start))
 		if window_has_input(&app.win) do needs_draw = true
@@ -271,8 +269,10 @@ run_ui :: proc(client: Client, device: string) {
 		free_all(context.temp_allocator)
 	}
 
-	sync.guard(&app.shared.mutex)
+	sync.lock(&app.shared.mutex)
 	app.shared.quit = true
+	sync.unlock(&app.shared.mutex)
+	for _ in 0 ..< ART_THREADS do sync.sema_post(&app.shared.art_wake)
 }
 
 // Everything the window shows, boiled down to something comparable. If this
@@ -969,12 +969,12 @@ want_art :: proc(app: ^App, url: string) {
 	if url == "" do return
 	if bindless_full(&app.gpu) do return
 	if _, have := app.art[url]; have do return
-	if art_from_cache(app, url) do return
 
 	sync.guard(&app.shared.mutex)
 	if app.shared.art_inflight[url] do return
 	app.shared.art_inflight[url] = true
 	append(&app.shared.art_wanted, Art_Request{strings.clone(url), ART_TEXTURE_PX, false})
+	sync.sema_post(&app.shared.art_wake)
 }
 
 // Spotify's image URLs encode the size in a fixed prefix, so the full-size
@@ -1005,15 +1005,17 @@ want_feature_art :: proc(app: ^App, url: string) {
 	if url == "" || url == app.feature_url do return
 	delete(app.feature_url)
 	app.feature_url = strings.clone(url)
-	if feature_from_cache(app, url) do return
 
 	sync.guard(&app.shared.mutex)
 	append(&app.shared.art_wanted, Art_Request{strings.clone(url), ART_FEATURE_PX, true})
+	sync.sema_post(&app.shared.art_wake)
 }
 
 // Each upload waits on the queue, so a scroll that queues fifty covers would
-// stall the frame. Take a few per frame; the rest wait their turn.
-ART_UPLOADS_PER_FRAME :: 4
+// stall the frame. Spend a slice of the frame on it and leave the rest for the
+// next one — a fixed count made a cache that had everything ready still trickle
+// in a few tiles at a time.
+ART_UPLOAD_BUDGET_MS :: 4.0
 
 // Covers are stored at this size. A tile is ~170-200 logical pixels, so this
 // is sharp, and it keeps a full bindless table down to a sane amount of VRAM.
@@ -1024,72 +1026,19 @@ ART_TEXTURE_PX :: 224
 // per song.
 ART_FEATURE_PX :: 640
 
-// A cover that is already on disk needs no fetch, so it does not belong on the
-// art thread's queue at all: waiting a turn there, then a turn in the
-// four-per-frame upload drip, is how a cached grid ended up fading in as if it
-// were downloading. Read, decode and upload it right here instead and the tile
-// is drawn with its cover on the very frame it was asked for.
-//
-// Decoding is a millisecond or so each, so a first frame that asks for a whole
-// screenful still has to be capped — past the budget the rest fall back to the
-// queue and arrive over the next couple of frames.
-@(private = "file")
-ART_SYNC_BUDGET_MS :: 6.0
-
-@(private = "file")
-art_from_cache :: proc(app: ^App, url: string) -> bool {
-	if app.art_sync_ms >= ART_SYNC_BUDGET_MS do return false
-	start := time.now()
-	defer app.art_sync_ms += time.duration_milliseconds(time.since(start))
-
-	body, cached := load_art(url)
-	if !cached do return false
-	defer delete(body)
-
-	pixels, w, h, ok := decode_art(body, ART_TEXTURE_PX)
-	if !ok do return false
-	defer delete(pixels)
-
-	app.art[strings.clone(url)] = texture_upload(&app.gpu, pixels, w, h, 4)
-	return true
-}
-
-@(private = "file")
-feature_from_cache :: proc(app: ^App, url: string) -> bool {
-	body, cached := load_art(url)
-	if !cached do return false
-	defer delete(body)
-
-	pixels, w, h, ok := decode_art(body, ART_FEATURE_PX)
-	if !ok do return false
-	defer delete(pixels)
-
-	if !app.feature_ready {
-		app.feature_slot = texture_upload(&app.gpu, pixels, w, h, 4)
-		app.feature_ready = true
-	} else {
-		texture_replace(&app.gpu, app.feature_slot, pixels, w, h, 4)
-	}
-	delete(app.feature_shown)
-	app.feature_shown = strings.clone(url)
-	return true
-}
-
 @(private = "file")
 upload_pending_art :: proc(app: ^App) -> (uploaded: bool) {
-	needs_redraw: bool
-	ready: [ART_UPLOADS_PER_FRAME]Art
-	count := 0
+	start := time.now()
+	for {
+		sync.lock(&app.shared.mutex)
+		a: Art
+		have := len(app.shared.art_ready) > 0
+		if have do a = pop_front(&app.shared.art_ready)
+		sync.unlock(&app.shared.mutex)
+		if !have do break
 
-	sync.lock(&app.shared.mutex)
-	for count < ART_UPLOADS_PER_FRAME && len(app.shared.art_ready) > 0 {
-		ready[count] = pop_front(&app.shared.art_ready)
-		count += 1
-	}
-	sync.unlock(&app.shared.mutex)
-
-	// Uploading touches the GPU queue, so it happens here on the render thread.
-	for a in ready[:count] {
+		// Uploading touches the GPU queue, so it happens here on the render
+		// thread.
 		if a.feature {
 			// One slot, reused: allocate it the first time, overwrite after.
 			if !app.feature_ready {
@@ -1100,13 +1049,15 @@ upload_pending_art :: proc(app: ^App) -> (uploaded: bool) {
 			}
 			delete(app.feature_shown)
 			app.feature_shown = a.url // taking ownership
-			needs_redraw = true
 		} else {
 			app.art[a.url] = texture_upload(&app.gpu, a.pixels, a.width, a.height, 4)
 		}
 		delete(a.pixels)
+		uploaded = true
+
+		if time.duration_milliseconds(time.since(start)) >= ART_UPLOAD_BUDGET_MS do break
 	}
-	return count > 0 || needs_redraw
+	return uploaded
 }
 
 // ------------------------------------------------------------------- worker
@@ -1476,13 +1427,24 @@ worker_sleep :: proc(s: ^Shared, seconds: int) -> bool {
 	return false
 }
 
-// Covers are fetched on their own thread. They used to be fetched inline in
-// the worker loop, which meant a screenful of new rows could hold up the next
+// Covers are fetched off the UI thread. They used to be fetched inline in the
+// worker loop, which meant a screenful of new rows could hold up the next
 // playback-state publish for seconds — the play button stayed a play button
 // while the music was already going.
+//
+// There are several of these threads because most requests never touch the
+// network at all: the cover is already on disk and all that is left is a
+// decode. Behind one thread, a screenful of cached covers came in one at a
+// time, and a single slow download stalled every cached cover queued behind
+// it. Waiting on a semaphore rather than polling means a request that arrives
+// mid-frame is picked up straight away instead of up to a tick later.
+ART_THREADS :: 4
+
 @(private = "file")
 art_worker :: proc(s: ^Shared) {
 	for {
+		sync.sema_wait(&s.art_wake)
+
 		sync.lock(&s.mutex)
 		quit := s.quit
 		req: Art_Request
@@ -1490,10 +1452,7 @@ art_worker :: proc(s: ^Shared) {
 		sync.unlock(&s.mutex)
 
 		if quit do return
-		if req.url == "" {
-			time.sleep(30 * time.Millisecond)
-			continue
-		}
+		if req.url == "" do continue
 
 		fetch_art(s, req)
 		delete(req.url)
