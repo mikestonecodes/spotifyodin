@@ -42,7 +42,9 @@ Command :: enum {
 
 Art :: struct {
 	url:     string,
-	pixels:  []byte,
+	pixels:  []byte, // what goes to the GPU
+	raw:     []byte, // the allocation `pixels` points into
+	kind:    Tex_Kind, // .Blocks once it has been through bc1_encode
 	width:   int,
 	height:  int,
 	feature: bool, // goes to the dedicated full-size slot
@@ -1011,12 +1013,6 @@ want_feature_art :: proc(app: ^App, url: string) {
 	sync.sema_post(&app.shared.art_wake)
 }
 
-// Each upload waits on the queue, so a scroll that queues fifty covers would
-// stall the frame. Spend a slice of the frame on it and leave the rest for the
-// next one — a fixed count made a cache that had everything ready still trickle
-// in a few tiles at a time.
-ART_UPLOAD_BUDGET_MS :: 4.0
-
 // Covers are stored at this size. A tile is ~170-200 logical pixels, so this
 // is sharp, and it keeps a full bindless table down to a sane amount of VRAM.
 ART_TEXTURE_PX :: 224
@@ -1028,36 +1024,59 @@ ART_FEATURE_PX :: 640
 
 @(private = "file")
 upload_pending_art :: proc(app: ^App) -> (uploaded: bool) {
-	start := time.now()
-	for {
-		sync.lock(&app.shared.mutex)
-		a: Art
-		have := len(app.shared.art_ready) > 0
-		if have do a = pop_front(&app.shared.art_ready)
-		sync.unlock(&app.shared.mutex)
-		if !have do break
+	// One submit for the batch, so this is no longer rationed a few at a time;
+	// the cap is only there so a long fast scroll cannot hand a single frame
+	// every cover it flew past.
+	ART_UPLOADS_PER_FRAME :: 64
 
-		// Uploading touches the GPU queue, so it happens here on the render
-		// thread.
+	sync.lock(&app.shared.mutex)
+	take := min(len(app.shared.art_ready), ART_UPLOADS_PER_FRAME)
+	ready := make([]Art, take, context.temp_allocator)
+	for i in 0 ..< take do ready[i] = pop_front(&app.shared.art_ready)
+	sync.unlock(&app.shared.mutex)
+	if len(ready) == 0 do return false
+
+	// Uploading touches the GPU queue, so it happens here on the render
+	// thread. Grid covers go up together in one submit; the feature cover
+	// overwrites its own slot and is rare enough to do on its own.
+	ups := make([dynamic]Upload, 0, len(ready), context.temp_allocator)
+	for a in ready {
+		if a.feature do continue
+		append(&ups, Upload{data = a.pixels, width = a.width, height = a.height, kind = a.kind})
+	}
+	texture_upload_many(&app.gpu, ups[:])
+
+	at := 0
+	for a in ready {
 		if a.feature {
 			// One slot, reused: allocate it the first time, overwrite after.
 			if !app.feature_ready {
-				app.feature_slot = texture_upload(&app.gpu, a.pixels, a.width, a.height, 4)
+				app.feature_slot = texture_upload_one(&app.gpu, a)
 				app.feature_ready = true
 			} else {
-				texture_replace(&app.gpu, app.feature_slot, a.pixels, a.width, a.height, 4)
+				texture_replace(&app.gpu, app.feature_slot, a.pixels, a.width, a.height, a.kind)
 			}
 			delete(app.feature_shown)
 			app.feature_shown = a.url // taking ownership
 		} else {
-			app.art[a.url] = texture_upload(&app.gpu, a.pixels, a.width, a.height, 4)
+			app.art[a.url] = ups[at].slot
+			at += 1
 		}
-		delete(a.pixels)
-		uploaded = true
-
-		if time.duration_milliseconds(time.since(start)) >= ART_UPLOAD_BUDGET_MS do break
+		free_art_pixels(a)
 	}
-	return uploaded
+	return true
+}
+
+@(private = "file")
+texture_upload_one :: proc(g: ^Gpu, a: Art) -> u32 {
+	if a.kind == .Blocks do return texture_upload_bc1(g, a.pixels, a.width, a.height)
+	return texture_upload(g, a.pixels, a.width, a.height, 4)
+}
+
+// `pixels` may be a view into the cache file rather than the allocation.
+@(private = "file")
+free_art_pixels :: proc(a: Art) {
+	delete(a.raw)
 }
 
 // ------------------------------------------------------------------- worker
@@ -1464,10 +1483,17 @@ art_worker :: proc(s: ^Shared) {
 fetch_art :: proc(s: ^Shared, req: Art_Request) {
 	url := req.url
 
-	// The disk cache holds the cover exactly as the CDN sent it, so a restart
-	// redraws the grid without touching the network. Anything already cached
-	// is normally taken on the UI thread; this path is what is left over when
-	// a frame ran out of its decode budget.
+	// The fast path, and the one that runs on every start after the first:
+	// the cover is already on disk as BC1 blocks at the size it is drawn, so
+	// there is nothing to decode and nothing to scale — it is read and handed
+	// to the driver as it lies.
+	if file, blocks, bw, bh, hit := load_art_blocks(url, req.max_px); hit {
+		publish_art(s, req, blocks, file, bw, bh, .Blocks)
+		return
+	}
+
+	// Otherwise the cover has to be made: the jpeg from the disk cache, or
+	// from the CDN if this is the first time it has been asked for.
 	body, cached := load_art(url)
 	if !cached {
 		res, ok := http_request("GET", url, nil)
@@ -1483,14 +1509,37 @@ fetch_art :: proc(s: ^Shared, req: Art_Request) {
 	data, out_w, out_h, ok := decode_art(body, req.max_px)
 	if !ok do return
 
+	// Compressing costs about as much as the decode did, once, and every
+	// later start gets the fast path above.
+	if g_bc1_ok && bc1_fits(out_w, out_h) {
+		blocks := bc1_encode(data, out_w, out_h)
+		delete(data)
+		save_art_blocks(url, req.max_px, blocks, out_w, out_h)
+		publish_art(s, req, blocks, blocks, out_w, out_h, .Blocks)
+		return
+	}
+	publish_art(s, req, data, data, out_w, out_h, .Color)
+}
+
+@(private = "file")
+publish_art :: proc(
+	s: ^Shared,
+	req: Art_Request,
+	pixels: []byte,
+	raw: []byte,
+	width, height: int,
+	kind: Tex_Kind,
+) {
 	sync.guard(&s.mutex)
 	append(
 		&s.art_ready,
 		Art {
-			url = strings.clone(url),
-			pixels = data,
-			width = out_w,
-			height = out_h,
+			url = strings.clone(req.url),
+			pixels = pixels,
+			raw = raw,
+			kind = kind,
+			width = width,
+			height = height,
 			feature = req.feature,
 		},
 	)
@@ -1504,17 +1553,16 @@ decode_art :: proc(body: []byte, max_px: int) -> (data: []byte, out_w, out_h: in
 	w, h, ch: i32
 	pixels := stbi.load_from_memory(raw_data(body), i32(len(body)), &w, &h, &ch, 4)
 	if pixels == nil do return nil, 0, 0, false
+	defer stbi.image_free(pixels)
 
 	// Covers arrive at 300px but a tile is nowhere near that on screen, and
 	// every slot in the bindless table costs VRAM for as long as it lives.
 	// Downscaling here keeps the whole table affordable. The feature cover is
-	// requested at exactly its source size, so the resize path does not always
-	// run.
+	// requested at exactly its source size, so the resize does not always run.
 	out_w, out_h = int(w), int(h)
 	if max(out_w, out_h) <= max_px {
 		data = make([]byte, out_w * out_h * 4)
 		copy(data, pixels[:out_w * out_h * 4])
-		stbi.image_free(pixels)
 		return data, out_w, out_h, true
 	}
 
@@ -1522,25 +1570,41 @@ decode_art :: proc(body: []byte, max_px: int) -> (data: []byte, out_w, out_h: in
 	nw := max(int(f32(out_w) * scale), 1)
 	nh := max(int(f32(out_h) * scale), 1)
 	small := make([]byte, nw * nh * 4)
-	resized := stbi.resize_uint8_srgb(
-		pixels,
-		w,
-		h,
-		0,
-		raw_data(small),
-		i32(nw),
-		i32(nh),
-		0,
-		4,
-		3, // alpha channel index
-		0,
-	)
-	stbi.image_free(pixels)
-	if resized == 0 {
-		delete(small)
-		return nil, 0, 0, false
-	}
+	box_downscale(pixels, out_w, out_h, small, nw, nh)
 	return small, nw, nh, true
+}
+
+// stb_image_resize was doing this, at about six times the cost of the jpeg
+// decode in front of it — a gamma-correct filter for a 300px cover going to
+// 224px, where the source of each output pixel is at most a 2x2 patch. An area
+// average over that patch is what the filter mostly reduces to anyway.
+@(private = "file")
+box_downscale :: proc(src: [^]byte, sw, sh: int, dst: []byte, dw, dh: int) {
+	for y in 0 ..< dh {
+		y0 := y * sh / dh
+		y1 := max((y + 1) * sh / dh, y0 + 1)
+		for x in 0 ..< dw {
+			x0 := x * sw / dw
+			x1 := max((x + 1) * sw / dw, x0 + 1)
+			r, g, b, a: u32
+			for sy in y0 ..< y1 {
+				o := (sy * sw + x0) * 4
+				for _ in x0 ..< x1 {
+					r += u32(src[o])
+					g += u32(src[o + 1])
+					b += u32(src[o + 2])
+					a += u32(src[o + 3])
+					o += 4
+				}
+			}
+			n := u32((y1 - y0) * (x1 - x0))
+			o := (y * dw + x) * 4
+			dst[o] = byte(r / n)
+			dst[o + 1] = byte(g / n)
+			dst[o + 2] = byte(b / n)
+			dst[o + 3] = byte(a / n)
+		}
+	}
 }
 
 // Takes a copy: `text` is usually a temp-allocated format result, and the

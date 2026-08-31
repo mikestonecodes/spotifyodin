@@ -9,6 +9,11 @@ import vk "vendor:vulkan"
 // album cover differ only by an integer in the vertex data.
 BINDLESS_CAPACITY :: 1024
 
+// Set once the device is up: whether covers can be kept as BC1 blocks all the
+// way from the disk cache into VRAM. Read from the art threads, written once
+// before they start.
+g_bc1_ok: bool
+
 FONT_TEX :: 0 // slot 0 is always the glyph atlas
 WHITE_TEX :: 1 // slot 1 is always a 1x1 opaque white pixel
 
@@ -36,6 +41,12 @@ bindless_init :: proc(g: ^Gpu) {
 		maxLod       = vk.LOD_CLAMP_NONE,
 	}
 	vk_check(vk.CreateSampler(g.device, &sampler_info, nil, &g.sampler), "CreateSampler")
+
+	// Covers are kept compressed if the GPU can sample them that way, which on
+	// anything desktop it can. Without it they stay RGBA and simply cost more.
+	props: vk.FormatProperties
+	vk.GetPhysicalDeviceFormatProperties(g.phys, .BC1_RGB_UNORM_BLOCK, &props)
+	g_bc1_ok = .SAMPLED_IMAGE in props.optimalTilingFeatures
 
 	binding := vk.DescriptorSetLayoutBinding {
 		binding         = 0,
@@ -103,15 +114,78 @@ bindless_init :: proc(g: ^Gpu) {
 	)
 }
 
+// What the bytes handed to an upload actually are.
+Tex_Kind :: enum {
+	Coverage, // one byte a pixel, drawn as alpha — glyphs
+	Color, // RGBA
+	Blocks, // BC1, four bytes a 4x4 block, sampled by the GPU as it is
+}
+
 // Uploads pixels and returns the slot the shader should index. `channels` is
 // 1 (coverage, drawn as alpha) or 4 (RGBA).
 texture_upload :: proc(g: ^Gpu, pixels: []byte, width, height, channels: int) -> u32 {
-	if len(g.textures) >= BINDLESS_CAPACITY do return WHITE_TEX
+	up := Upload {
+		data   = pixels,
+		width  = width,
+		height = height,
+		kind   = channels == 1 ? .Coverage : .Color,
+	}
+	ups := []Upload{up}
+	texture_upload_many(g, ups)
+	return ups[0].slot
+}
 
-	slot := u32(len(g.textures))
-	append(&g.textures, make_texture(g, pixels, width, height, channels))
-	write_texture_descriptor(g, slot)
-	return slot
+// Covers arrive as BC1 blocks, straight off disk in the form the sampler
+// wants. See bc1.odin.
+texture_upload_bc1 :: proc(g: ^Gpu, blocks: []byte, width, height: int) -> u32 {
+	up := Upload {
+		data   = blocks,
+		width  = width,
+		height = height,
+		kind   = .Blocks,
+	}
+	ups := []Upload{up}
+	texture_upload_many(g, ups)
+	return ups[0].slot
+}
+
+Upload :: struct {
+	data:   []byte,
+	width:  int,
+	height: int,
+	kind:   Tex_Kind,
+	slot:   u32, // filled in
+}
+
+// Every upload used to be its own submit and its own fence wait, so a frame
+// that had a screenful of covers ready paid that round trip a few dozen times
+// and had to be rationed to four a frame. The copies all go in one command
+// buffer now and the whole batch costs a single wait.
+texture_upload_many :: proc(g: ^Gpu, ups: []Upload) {
+	if len(ups) == 0 do return
+
+	cmd := begin_one_shot(g)
+	staging := make([][2]u64, len(ups), context.temp_allocator)
+	n := 0
+
+	for &up in ups {
+		if len(g.textures) >= BINDLESS_CAPACITY {
+			up.slot = WHITE_TEX
+			continue
+		}
+		tex, buf, mem := stage_texture(g, cmd, up.data, up.width, up.height, up.kind)
+		up.slot = u32(len(g.textures))
+		append(&g.textures, tex)
+		write_texture_descriptor(g, up.slot)
+		staging[n] = {u64(buf), u64(mem)}
+		n += 1
+	}
+
+	end_one_shot(g, cmd)
+	for s in staging[:n] {
+		vk.DestroyBuffer(g.device, vk.Buffer(s[0]), nil)
+		vk.FreeMemory(g.device, vk.DeviceMemory(s[1]), nil)
+	}
 }
 
 @(private = "file")
@@ -133,12 +207,30 @@ write_texture_descriptor :: proc(g: ^Gpu, slot: u32) {
 	vk.UpdateDescriptorSets(g.device, 1, &write, 0, nil)
 }
 
+// Creates the image and records its copy into `cmd`. The staging buffer it
+// returns has to outlive the submit, so the caller frees it after the wait.
 @(private = "file")
-make_texture :: proc(g: ^Gpu, pixels: []byte, width, height, channels: int) -> Texture {
-	assert(channels == 1 || channels == 4)
-
-	format: vk.Format = channels == 4 ? .R8G8B8A8_UNORM : .R8_UNORM
-	tex := Texture {
+stage_texture :: proc(
+	g: ^Gpu,
+	cmd: vk.CommandBuffer,
+	pixels: []byte,
+	width, height: int,
+	kind: Tex_Kind,
+) -> (
+	tex: Texture,
+	staging: vk.Buffer,
+	staging_mem: vk.DeviceMemory,
+) {
+	format: vk.Format
+	switch kind {
+	case .Coverage:
+		format = .R8_UNORM
+	case .Color:
+		format = .R8G8B8A8_UNORM
+	case .Blocks:
+		format = .BC1_RGB_UNORM_BLOCK
+	}
+	tex = Texture {
 		width  = width,
 		height = height,
 	}
@@ -168,14 +260,14 @@ make_texture :: proc(g: ^Gpu, pixels: []byte, width, height, channels: int) -> T
 	vk_check(vk.AllocateMemory(g.device, &alloc, nil, &tex.memory), "AllocateMemory")
 	vk.BindImageMemory(g.device, tex.image, tex.memory, 0)
 
-	staging, staging_mem, staging_ptr := create_mapped_buffer(
+	staging_ptr: rawptr
+	staging, staging_mem, staging_ptr = create_mapped_buffer(
 		g,
 		vk.DeviceSize(len(pixels)),
 		{.TRANSFER_SRC},
 	)
 	mem.copy(staging_ptr, raw_data(pixels), len(pixels))
 
-	cmd := begin_one_shot(g)
 	image_barrier(cmd, tex.image, .UNDEFINED, .TRANSFER_DST_OPTIMAL)
 	region := vk.BufferImageCopy {
 		imageSubresource = {aspectMask = {.COLOR}, layerCount = 1},
@@ -183,17 +275,12 @@ make_texture :: proc(g: ^Gpu, pixels: []byte, width, height, channels: int) -> T
 	}
 	vk.CmdCopyBufferToImage(cmd, staging, tex.image, .TRANSFER_DST_OPTIMAL, 1, &region)
 	image_barrier(cmd, tex.image, .TRANSFER_DST_OPTIMAL, .SHADER_READ_ONLY_OPTIMAL)
-	end_one_shot(g, cmd)
-
-	vk.DestroyBuffer(g.device, staging, nil)
-	vk.FreeMemory(g.device, staging_mem, nil)
 
 	// A single-channel texture is coverage: broadcast it to alpha and leave
-	// RGB white, so the one shader path handles glyphs and images alike.
+	// RGB white, so the one shader path handles glyphs and images alike. BC1
+	// carries no alpha of its own and reads back as opaque.
 	swizzle := vk.ComponentMapping{.R, .G, .B, .A}
-	if channels == 1 {
-		swizzle = {.ONE, .ONE, .ONE, .R}
-	}
+	if kind == .Coverage do swizzle = {.ONE, .ONE, .ONE, .R}
 	view_info := vk.ImageViewCreateInfo {
 		sType = .IMAGE_VIEW_CREATE_INFO,
 		image = tex.image,
@@ -203,13 +290,12 @@ make_texture :: proc(g: ^Gpu, pixels: []byte, width, height, channels: int) -> T
 		subresourceRange = {aspectMask = {.COLOR}, levelCount = 1, layerCount = 1},
 	}
 	vk_check(vk.CreateImageView(g.device, &view_info, nil, &tex.view), "CreateImageView")
-
-	return tex
+	return
 }
 
 // Swaps new pixels into an existing slot, so a texture that is replaced often —
 // the feature cover, at full size — costs one entry rather than one per track.
-texture_replace :: proc(g: ^Gpu, slot: u32, pixels: []byte, width, height, channels: int) {
+texture_replace :: proc(g: ^Gpu, slot: u32, pixels: []byte, width, height: int, kind: Tex_Kind) {
 	if int(slot) >= len(g.textures) do return
 
 	// The old image may still be referenced by a frame in flight. Replacing it
@@ -221,7 +307,13 @@ texture_replace :: proc(g: ^Gpu, slot: u32, pixels: []byte, width, height, chann
 	vk.DestroyImage(g.device, old.image, nil)
 	vk.FreeMemory(g.device, old.memory, nil)
 
-	g.textures[slot] = make_texture(g, pixels, width, height, channels)
+	cmd := begin_one_shot(g)
+	tex, buf, mem := stage_texture(g, cmd, pixels, width, height, kind)
+	end_one_shot(g, cmd)
+	vk.DestroyBuffer(g.device, buf, nil)
+	vk.FreeMemory(g.device, mem, nil)
+
+	g.textures[slot] = tex
 	write_texture_descriptor(g, slot)
 }
 

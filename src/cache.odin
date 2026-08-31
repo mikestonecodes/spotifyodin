@@ -95,6 +95,69 @@ art_cache_path :: proc(url: string) -> string {
 	return fmt.tprintf("%s/art/%s", dir, id)
 }
 
+// Beside the downloaded jpeg sits the cover in the form the GPU samples: BC1
+// blocks at the size it is drawn. That file is the whole reason a second run
+// fills the grid at once — no decode, no downscale, just a read the size of a
+// jpeg and a copy into VRAM. The size is part of the name so changing
+// ART_TEXTURE_PX starts a new set rather than quietly serving the old one.
+@(private = "file")
+ART_BLOCKS_MAGIC :: "SBC1"
+
+@(private = "file")
+art_blocks_path :: proc(url: string, px: int) -> string {
+	base := art_cache_path(url)
+	if base == "" do return ""
+	return fmt.tprintf("%s.%d.bc1", base, px)
+}
+
+// Returns the whole file and the blocks within it: the header is skipped by
+// slicing rather than by copying 25KB out of the way, so `file` is what has to
+// be freed once the blocks have been handed to the GPU.
+load_art_blocks :: proc(
+	url: string,
+	px: int,
+) -> (
+	file: []byte,
+	blocks: []byte,
+	width, height: int,
+	ok: bool,
+) {
+	path := art_blocks_path(url, px)
+	if path == "" do return nil, nil, 0, 0, false
+	data, err := os.read_entire_file_from_path(path, context.allocator)
+	if err != nil do return nil, nil, 0, 0, false
+
+	if len(data) < 8 || string(data[:4]) != ART_BLOCKS_MAGIC {
+		delete(data)
+		return nil, nil, 0, 0, false
+	}
+	w := int(data[4]) | int(data[5]) << 8
+	h := int(data[6]) | int(data[7]) << 8
+	if len(data) - 8 != bc1_size(w, h) {
+		delete(data)
+		return nil, nil, 0, 0, false
+	}
+	return data, data[8:], w, h, true
+}
+
+save_art_blocks :: proc(url: string, px: int, blocks: []byte, width, height: int) {
+	path := art_blocks_path(url, px)
+	if path == "" || len(blocks) == 0 do return
+
+	dir := cache_dir()
+	defer delete(dir)
+	os.make_directory_all(fmt.tprintf("%s/art", dir))
+
+	file := make([]byte, 8 + len(blocks), context.temp_allocator)
+	copy(file, ART_BLOCKS_MAGIC)
+	file[4] = byte(width)
+	file[5] = byte(width >> 8)
+	file[6] = byte(height)
+	file[7] = byte(height >> 8)
+	copy(file[8:], blocks)
+	_ = os.write_entire_file(path, file)
+}
+
 load_art :: proc(url: string) -> ([]byte, bool) {
 	path := art_cache_path(url)
 	if path == "" do return nil, false
