@@ -143,18 +143,22 @@ liked_track_uris :: proc(token: string, host: string) -> (uris: [dynamic]string,
 	username := spotify_username(token)
 	if username == "" do return uris, false
 	defer delete(username)
+	return context_track_uris(token, host, fmt.tprintf("spotify:user:%s:collection", username))
+}
 
-	endpoint := fmt.tprintf(
-		"https://%s/context-resolve/v1/spotify:user:%s:collection",
-		host,
-		username,
-	)
+// The songs in anything that can be played as a whole: the liked list, a
+// playlist (Discover Weekly and the other mixes included — they are playlists
+// made for one user), an album, or an artist, which resolves to their top
+// tracks and then their records. Episodes and local files are left out;
+// neither can be played here.
+context_track_uris :: proc(token, host, context_uri: string) -> (uris: [dynamic]string, ok: bool) {
+	endpoint := fmt.tprintf("https://%s/context-resolve/v1/%s", host, context_uri)
 	headers := []string{fmt.tprintf("Authorization: Bearer %s", token)}
 
 	res, req_ok := http_request("GET", endpoint, headers)
 	defer delete(res.body)
 	if !req_ok || res.status != 200 {
-		fmt.eprintfln("context-resolve failed (%d)", res.status)
+		fmt.eprintfln("context-resolve %s failed (%d)", context_uri, res.status)
 		return uris, false
 	}
 
@@ -162,13 +166,43 @@ liked_track_uris :: proc(token: string, host: string) -> (uris: [dynamic]string,
 	if err != nil do return uris, false
 	defer json.destroy_value(v)
 
+	seen := make(map[string]bool, 64, context.temp_allocator)
 	for page in jarr(v, "pages") {
 		for track in jarr(page, "tracks") {
 			uri := jstr(track, "uri")
-			if uri != "" do append(&uris, strings.clone(uri))
+			if !strings.has_prefix(uri, "spotify:track:") || seen[uri] do continue
+			seen[uri] = true
+			append(&uris, strings.clone(uri))
 		}
 	}
 	return uris, len(uris) > 0
+}
+
+// The songs in a context, described. Anything `known` already describes is
+// copied from there, so a playlist full of liked songs costs one request.
+fetch_context_tracks :: proc(
+	session_token, context_uri: string,
+	known: map[string]Track,
+	progress: Progress = nil,
+	user: rawptr = nil,
+) -> (
+	tracks: [dynamic]Track,
+	ok: bool,
+) {
+	host := spclient_host()
+
+	uris, uris_ok := context_track_uris(session_token, host, context_uri)
+	defer {
+		for u in uris do delete(u)
+		delete(uris)
+	}
+	if !uris_ok do return tracks, false
+
+	todo := make([dynamic]int, 0, len(uris), context.temp_allocator)
+	for uri, i in uris {
+		if _, have := known[uri]; !have do append(&todo, i)
+	}
+	return describe_tracks(session_token, host, uris[:], known, todo[:], progress, user)
 }
 
 @(private = "file")

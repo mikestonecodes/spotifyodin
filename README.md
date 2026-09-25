@@ -57,6 +57,14 @@ In the window: the queue is a grid of album covers — click one to play it,
 click the bar to seek, scroll with the wheel, drag the volume slider. Space toggles play, left/right skip,
 up/down change volume, `r` reshuffles, `q`/Escape quits.
 
+`/` opens the menu. With nothing typed it lists your liked songs, then
+Discover Weekly, Release Radar and the daily mixes, then the rest of your
+playlists. Typing narrows those down and also searches Spotify for artists,
+songs, albums and playlists. Arrows or the pointer choose, Enter plays: a song
+plays next and the queue carries on after it; anything else becomes the queue —
+playlists shuffled, albums and an artist's top songs in their own order.
+Escape goes back to the grid.
+
 Playback is native — the window decodes and plays audio itself, so no Spotify
 client has to be running anywhere.
 
@@ -191,6 +199,8 @@ before the last track of the current one ends.
 | --- | --- |
 | `src/main.odin` | CLI, device selection, the headless playback loop |
 | `src/app.odin` | the window's screen, and the worker thread behind it |
+| `src/menu.odin` | the `/` menu: its rows, its keys, and drawing it |
+| `src/browse.odin` | your playlists, search, and turning a pick into songs |
 | `src/ui.odin` | immediate-mode core: draw list, ids, widgets, animation |
 | `src/window.odin` | Wayland window, xdg-shell, pointer and keyboard |
 | `src/gpu.odin` | Vulkan instance, device, swapchain, per-frame state |

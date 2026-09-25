@@ -4,6 +4,7 @@ import "core:fmt"
 import "core:os"
 import "core:math"
 import "core:math/linalg"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:thread"
@@ -87,6 +88,36 @@ Shared :: struct {
 	art_ready:    [dynamic]Art,
 	art_inflight: map[string]bool,
 	art_wake:     sync.Sema,
+
+	// What the queue is, and a count that moves whenever it is replaced, so
+	// the grid knows the positions it remembers are from a different list.
+	source_uri:   string,
+	source_name:  string,
+	queue_gen:    int,
+	liked_count:  int,
+
+	// The / menu. The browse thread writes the lists; the UI asks for a
+	// search by setting search_want, and the answer is for found_for.
+	playlists:    [dynamic]Source,
+	found:        [dynamic]Source,
+	found_for:    string,
+	found_failed: bool,
+	search_want:  string,
+	browse_gen:   int, // moves whenever either list changes
+	browse_wake:  sync.Sema,
+
+	// A pick on its way to being the queue: asked for by the UI, resolved by
+	// the open thread, taken by the worker.
+	open_want:    Source,
+	open_pending: bool,
+	open_wake:    sync.Sema,
+	opening:      string, // what is being opened, or why it could not be
+	opening_failed: bool,
+	opening_at:   time.Time,
+	opening_done: int,
+	opening_total: int,
+	ready:        Queue_Ready,
+	has_ready:    bool,
 }
 
 App :: struct {
@@ -99,6 +130,17 @@ App :: struct {
 	art:     map[string]u32,
 	worker:  ^thread.Thread,
 	art_threads: [ART_THREADS]^thread.Thread,
+	browse_thread: ^thread.Thread,
+	open_thread:   ^thread.Thread,
+
+	// The / menu, open or shut, and what is typed into it. The rows are not
+	// kept: menu_rows derives them every frame from the query and the lists.
+	menu_open:    bool,
+	query:        [dynamic]u8,
+	query_at:     time.Time, // the last edit, so a search waits for a pause
+	menu_at:      int, // the chosen row
+	menu_top:     int, // the first row on screen
+	queue_gen:    int, // the queue the grid's positions belong to
 
 	saved_volume: f32,
 
@@ -179,6 +221,8 @@ run_ui :: proc(client: Client, device: string) {
 	for i in 0 ..< ART_THREADS {
 		app.art_threads[i] = thread.create_and_start_with_poly_data(&app.shared, art_worker)
 	}
+	app.browse_thread = thread.create_and_start_with_poly_data(&app.shared, browse_main)
+	app.open_thread = thread.create_and_start_with_poly_data(&app.shared, open_main)
 
 	last_frame := time.now()
 	last_draw := time.now()
@@ -204,6 +248,7 @@ run_ui :: proc(client: Client, device: string) {
 		} else if last_state.playing {
 			timeout = 40 // keep the scrub line moving smoothly
 		}
+		if wait := window_repeat_wait_ms(&app.win); wait >= 0 do timeout = min(timeout, wait)
 		window_poll(&app.win, timeout)
 
 		now := time.now()
@@ -275,6 +320,9 @@ run_ui :: proc(client: Client, device: string) {
 	app.shared.quit = true
 	sync.unlock(&app.shared.mutex)
 	for _ in 0 ..< ART_THREADS do sync.sema_post(&app.shared.art_wake)
+	sync.sema_post(&app.shared.browse_wake)
+	sync.sema_post(&app.shared.open_wake)
+	delete(app.query)
 }
 
 // Everything the window shows, boiled down to something comparable. If this
@@ -312,6 +360,11 @@ Frame_State :: struct {
 	width:        int,
 	height:       int,
 	bar:          bool,
+	browse_gen:   int,
+	queue_gen:    int,
+	opening:      u64,
+	opening_done: int,
+	chip:         bool,
 }
 
 @(private = "file")
@@ -332,6 +385,11 @@ frame_state :: proc(app: ^App) -> (fs: Frame_State) {
 	fs.duration = s.duration_ms
 	fs.count = len(s.tracks)
 	fs.volume = s.volume
+	fs.browse_gen = s.browse_gen
+	fs.queue_gen = s.queue_gen
+	fs.opening = ui_id(s.opening)
+	fs.opening_done = s.opening_done
+	fs.chip = chip_shown(s)
 	sync.unlock(&s.mutex)
 
 	fs.art_count = len(app.art)
@@ -344,6 +402,16 @@ frame_state :: proc(app: ^App) -> (fs: Frame_State) {
 
 @(private = "file")
 handle_keys :: proc(app: ^App) {
+	// The menu takes every key while it is up: it is typed into, and a
+	// space or a j in an artist's name is not a transport command.
+	if app.menu_open {
+		menu_keys(app)
+		return
+	}
+	if window_key_pressed(&app.win, KEY_SLASH) && !app.win.input.shift {
+		menu_show(app, true)
+		return
+	}
 	if window_key_pressed(&app.win, KEY_ESC) || window_key_pressed(&app.win, KEY_Q) {
 		app.win.should_close = true
 	}
@@ -398,6 +466,7 @@ draw_app :: proc(app: ^App) {
 	duration := s.duration_ms
 	progress := s.progress_ms
 	since := time.duration_milliseconds(time.since(s.last_poll))
+	queue_gen := s.queue_gen
 	sync.unlock(&s.mutex)
 
 	// Straight from the audio device: the worker's copy is only as fresh as
@@ -415,9 +484,14 @@ draw_app :: proc(app: ^App) {
 	// back as it goes.
 	shown := ui_anim(ui, ui_id("bar"), app.show_bar ? 1 : 0, 16)
 
+	// Under the menu the grid is only a backdrop: nothing on it answers the
+	// pointer, or a click meant for a row would also start the tile beneath.
+	had_mouse := ui.has_mouse
+	if app.menu_open do ui.has_mouse = false
+
 	list := Rect{0, 0, w, h - BAR_H * shown}
 	if loaded && count > 0 {
-		draw_queue(app, list, now_uri, now_name, now_artist, progress, duration)
+		draw_queue(app, list, now_uri, now_name, now_artist, progress, duration, queue_gen)
 	} else {
 		ui_text_centred(ui, &ui.regular, status, list, 18, status_error ? WARN : MUTED)
 	}
@@ -433,6 +507,10 @@ draw_app :: proc(app: ^App) {
 			status_error,
 		)
 	}
+
+	draw_chip(app, list)
+	ui.has_mouse = had_mouse
+	draw_menu(app, {0, 0, w, h})
 }
 
 @(private = "file")
@@ -493,9 +571,18 @@ draw_queue :: proc(
 	r: Rect,
 	now_uri, now_name, now_artist: string,
 	progress, duration: int,
+	queue_gen: int,
 ) {
 	ui := &app.ui
 	s := &app.shared
+
+	// A new queue: where the playing track sat and how far down the grid
+	// was scrolled both belonged to the old one.
+	requeued := queue_gen != app.queue_gen
+	if requeued {
+		app.queue_gen = queue_gen
+		app.scroll.target = 0
+	}
 
 	sync.lock(&s.mutex)
 	count := len(s.tracks)
@@ -509,7 +596,7 @@ draw_queue :: proc(
 	previous_start := app.now_index >= 0 ? app.now_index + 1 : 0
 	previous_grid := grid_for(r.w, app.now_index >= 0 ? count - 1 : count)
 	_ = previous_start
-	track_change_pulse(app, now_uri, previous_grid, r, count)
+	track_change_pulse(app, now_uri, previous_grid, r, count, requeued)
 
 	// The grid is the queue from the next track onward, wrapping round, so the
 	// tile beside the feature really is what plays next.
@@ -719,16 +806,18 @@ draw_feature :: proc(app: ^App, r: Rect, name, artist: string, progress, duratio
 }
 
 @(private = "file")
-track_change_pulse :: proc(app: ^App, now_uri: string, layout: Grid, area: Rect, count: int) {
+track_change_pulse :: proc(app: ^App, now_uri: string, layout: Grid, area: Rect, count: int, requeued: bool) {
 	ui := &app.ui
-	if now_uri != app.last_now_uri {
+	if now_uri != app.last_now_uri || requeued {
 		delete(app.last_now_uri)
 		app.last_now_uri = strings.clone(now_uri)
 		app.pulse = 1
 
 		// Remember where it sits so the grid can leave it out — it is already
-		// on screen as the feature tile.
-		previous_index := app.now_index
+		// on screen as the feature tile. After a new queue there is no
+		// "where it was": the old index is a place in a list that is gone,
+		// so nothing slides and nothing grows out of a tile.
+		previous_index := requeued ? -1 : app.now_index
 		app.now_index = -1
 		big, small: string
 		sync.lock(&app.shared.mutex)
@@ -966,7 +1055,6 @@ current_art_slot :: proc(app: ^App) -> (u32, bool) {
 
 // ------------------------------------------------------------------ art I/O
 
-@(private = "file")
 want_art :: proc(app: ^App, url: string) {
 	if url == "" do return
 	if bindless_full(&app.gpu) do return
@@ -1226,12 +1314,24 @@ worker_main :: proc(app: ^App) {
 		fmt.eprintfln("skipping %d tracks known to be unavailable", len(unplayable))
 	}
 
+	// What the queue is drawn from: the liked list to begin with, and then
+	// whatever the menu opens. A list the menu brought is owned by `picked`.
 	pool := playable[:]
+	picked: [dynamic]Track
+	defer delete(picked)
+	// Every list the menu has handed over, for as long as the window is
+	// open. The grid reads a track's strings without holding the lock, so a
+	// queue that has been replaced may still be on screen for a frame.
+	kept: [dynamic][dynamic]Track
+	defer delete(kept)
 	order := smart_shuffle(pool)
 
 	sync.lock(&s.mutex)
 	append(&s.tracks, ..order)
 	s.loaded = true
+	s.liked_count = len(pool)
+	s.source_uri = strings.clone(LIKED_URI)
+	s.source_name = strings.clone(LIKED_NAME)
 	sync.unlock(&s.mutex)
 	set_status(s, fmt.tprintf("%d songs", len(order)))
 
@@ -1274,9 +1374,53 @@ worker_main :: proc(app: ^App) {
 		s.play_index = -1
 		seek_ms := s.seek_ms
 		s.seek_ms = -1
+		ready, has_ready := s.ready, s.has_ready
+		s.ready, s.has_ready = {}, false
 		sync.unlock(&s.mutex)
 
 		if quit do return
+
+		if has_ready {
+			append(&kept, ready.tracks)
+			defer delete(ready.uri)
+			defer delete(ready.name)
+
+			fresh: [dynamic]Track
+			if ready.liked do append(&fresh, ..playable[:])
+			else do for t in ready.tracks do if !unplayable[t.uri] do append(&fresh, t)
+
+			switch {
+			case len(fresh) == 0:
+				delete(fresh)
+				open_failed(s, fmt.tprintf("nothing in %s plays here", ready.name))
+			case ready.now:
+				// One song, straight after the one playing: the queue it
+				// interrupts carries on afterwards, where it was.
+				at := playing >= 0 ? playing + 1 : 0
+				grown := make([]Track, len(order) + 1)
+				copy(grown[:at], order[:at])
+				grown[at] = fresh[0]
+				copy(grown[at + 1:], order[at:])
+				delete(order)
+				order = grown
+				if index >= at do index += 1
+				delete(fresh)
+				open_done(s, order)
+				load_index = at
+			case:
+				delete(picked)
+				picked = fresh
+				pool = ready.liked ? playable[:] : picked[:]
+				delete(order)
+				order = ready.shuffle ? smart_shuffle(pool) : slice.clone(pool)
+				open_done(s, order, ready.uri, ready.name)
+				// Nothing in the new queue has played, so there is nothing
+				// for previous to go back to and nothing to put back on
+				// screen if the first load fails.
+				index, playing = -1, -1
+				load_index = 0
+			}
+		}
 
 		// Answer the access point's keepalive. Nothing else reads the socket
 		// while a track plays, and an unanswered ping gets us hung up on —
@@ -1311,13 +1455,9 @@ worker_main :: proc(app: ^App) {
 				if pos.position_ms > 3000 do player_seek(player, 0)
 				else do load_index = index - 1
 			case .Reshuffle:
-				new_order := smart_shuffle(pool)
-				sync.lock(&s.mutex)
-				clear(&s.tracks)
-				append(&s.tracks, ..new_order)
-				sync.unlock(&s.mutex)
 				delete(order)
-				order = new_order
+				order = smart_shuffle(pool)
+				publish_queue(s, order)
 				load_index = 0
 			}
 		}
@@ -1417,6 +1557,34 @@ worker_main :: proc(app: ^App) {
 		// Wake instantly when the UI queues something; otherwise tick often
 		// enough to notice a track ending.
 		sync.sema_wait_with_timeout(&s.wake, 100 * time.Millisecond)
+	}
+}
+
+// A new queue for the grid. The count moves so the grid lets go of where it
+// thought the playing track sat: that was a place in the old list.
+@(private = "file")
+publish_queue :: proc(s: ^Shared, order: []Track) {
+	sync.guard(&s.mutex)
+	clear(&s.tracks)
+	append(&s.tracks, ..order)
+	s.queue_gen += 1
+}
+
+// An open that became the queue. `uri` is what the queue is now from; empty
+// when that has not changed — one song slotted in is still the queue it was
+// slotted into.
+@(private = "file")
+open_done :: proc(s: ^Shared, order: []Track, uri := "", name := "") {
+	publish_queue(s, order)
+	sync.guard(&s.mutex)
+	delete(s.opening)
+	s.opening = ""
+	s.opening_failed = false
+	if uri != "" {
+		delete(s.source_uri)
+		delete(s.source_name)
+		s.source_uri = strings.clone(uri)
+		s.source_name = strings.clone(name)
 	}
 }
 

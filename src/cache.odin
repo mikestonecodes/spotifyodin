@@ -48,6 +48,36 @@ save_library :: proc(tracks: []Track, complete := true) {
 	_ = os.write_entire_file(library_cache_path(), data)
 }
 
+// Songs described for a playlist, album or artist, kept so opening one again —
+// Discover Weekly every week, a big playlist every time — only asks about the
+// songs it has not seen before.
+known_cache_path :: proc() -> string {
+	return fmt.aprintf("%s/known.json", cache_dir())
+}
+
+save_known :: proc(tracks: []Track) {
+	if len(tracks) == 0 do return
+	os.make_directory_all(cache_dir())
+	data, err := json.marshal(Cached_Library{version = CACHE_VERSION, complete = true, saved_at = time.now()._nsec / 1e9, tracks = tracks})
+	if err != nil do return
+	defer delete(data)
+	path := known_cache_path()
+	defer delete(path)
+	_ = os.write_entire_file(path, data)
+}
+
+load_known :: proc() -> (tracks: []Track) {
+	path := known_cache_path()
+	defer delete(path)
+	data, err := os.read_entire_file_from_path(path, context.allocator)
+	if err != nil do return nil
+	defer delete(data)
+
+	cached: Cached_Library
+	if json.unmarshal(data, &cached) != nil || cached.version != CACHE_VERSION do return nil
+	return cached.tracks
+}
+
 load_library :: proc() -> (tracks: [dynamic]Track, complete: bool, ok: bool) {
 	_, _, _ = tracks, complete, ok
 	data, err := os.read_entire_file_from_path(library_cache_path(), context.allocator)
@@ -79,7 +109,10 @@ load_library :: proc() -> (tracks: [dynamic]Track, complete: bool, ok: bool) {
 art_cache_path :: proc(url: string) -> string {
 	id := url
 	if i := strings.last_index_byte(url, '/'); i >= 0 do id = url[i + 1:]
-	if id == "" do return ""
+	// A cover id is a long hash. Some playlist pictures end in something
+	// short instead — Discover Weekly's and Release Radar's both end in
+	// /en — and filed under that they would all share one file.
+	if len(id) < 16 do return ""
 	// Only the plain hex ids get a file; anything else stays uncached rather
 	// than deciding where in the filesystem to write.
 	for ch in id {
@@ -290,5 +323,6 @@ load_username :: proc() -> string {
 
 forget_library :: proc() {
 	_ = os.remove(library_cache_path())
+	_ = os.remove(known_cache_path())
 	_ = os.remove(unplayable_path())
 }

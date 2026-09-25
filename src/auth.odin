@@ -9,6 +9,7 @@ import "core:fmt"
 import "core:net"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:time"
 
 REDIRECT_PORT :: 8888
@@ -116,8 +117,15 @@ token_expired :: proc(kind := Token_Kind.Web_API) -> bool {
 	return time.now()._nsec / 1e9 >= t.expires_at - 60
 }
 
+// Held across a refresh. Spotify rotates the refresh token as it hands out a
+// new access token, so two threads refreshing at once leave one of them with a
+// refresh token that no longer works — and that one falls back to the browser.
+@(private = "file")
+g_token_mutex: sync.Mutex
+
 // Returns a valid access token, refreshing or running the login flow as needed.
 get_access_token :: proc(kind := Token_Kind.Web_API) -> (token: string, ok: bool) {
+	sync.guard(&g_token_mutex)
 	id, scopes, redirect := token_settings(kind)
 	has_id := id != ""
 	if !has_id {

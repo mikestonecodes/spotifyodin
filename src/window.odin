@@ -5,6 +5,7 @@ import "core:fmt"
 import "core:os"
 import "core:strings"
 import "core:sys/linux"
+import "core:time"
 import wl "./wayland"
 
 BTN_LEFT :: 0x110
@@ -27,6 +28,12 @@ KEY_J :: 36
 KEY_K :: 37
 KEY_L :: 38
 KEY_SEMICOLON :: 39
+KEY_SLASH :: 53
+KEY_ENTER :: 28
+KEY_KPENTER :: 96
+KEY_BACKSPACE :: 14
+KEY_TAB :: 15
+KEY_U :: 22
 
 Input :: struct {
 	mouse:          [2]f32,
@@ -36,6 +43,11 @@ Input :: struct {
 	released:       [3]bool,
 	scroll:         f32,
 	keys_pressed:   [dynamic]u32,
+	// A key held down, sent again at the compositor's repeat rate. Kept apart
+	// from keys_pressed so holding a transport key still means one press.
+	keys_repeated:  [dynamic]u32,
+	shift:          bool,
+	ctrl:           bool,
 }
 
 Window :: struct {
@@ -67,6 +79,11 @@ Window :: struct {
 	should_close: bool,
 	input:        Input,
 	last_mouse:   [2]f32,
+
+	held:         u32, // the key that repeats, or 0
+	next_repeat:  time.Time,
+	repeat_delay: time.Duration,
+	repeat_every: time.Duration, // 0: the compositor asked for no repeat
 }
 
 @(private = "file")
@@ -93,6 +110,8 @@ window_open :: proc(w: ^Window, title: string, width, height: int) -> bool {
 	g_win_ctx = context
 	w.width, w.height = width, height
 	w.scale = 1
+	w.repeat_delay = 400 * time.Millisecond
+	w.repeat_every = 40 * time.Millisecond
 
 	w.display = wl.display_connect(nil)
 	if w.display == nil {
@@ -310,10 +329,24 @@ on_seat_capabilities :: proc "c" (data: rawptr, self: ^wl.wl_seat, capabilities:
 				linux.close(linux.Fd(fd)) // we only use raw keycodes
 			},
 			enter = proc "c" (data: rawptr, self: ^wl.wl_keyboard, serial: u32, surface: ^wl.wl_surface, keys: ^wl.Array) {},
-			leave = proc "c" (data: rawptr, self: ^wl.wl_keyboard, serial: u32, surface: ^wl.wl_surface) {},
+			leave = proc "c" (data: rawptr, self: ^wl.wl_keyboard, serial: u32, surface: ^wl.wl_surface) {
+				w := cast(^Window)data
+				w.held = 0
+				w.input.shift, w.input.ctrl = false, false
+			},
 			key = on_key,
-			modifiers = proc "c" (data: rawptr, self: ^wl.wl_keyboard, serial, depressed, latched, locked, group: u32) {},
-			repeat_info = proc "c" (data: rawptr, self: ^wl.wl_keyboard, rate, delay: i32) {},
+			// Keycodes are read raw, so the modifiers are too: shift and
+			// control are the first and third bits of every xkb keymap.
+			modifiers = proc "c" (data: rawptr, self: ^wl.wl_keyboard, serial, depressed, latched, locked, group: u32) {
+				w := cast(^Window)data
+				w.input.shift = (depressed | latched) & 1 != 0
+				w.input.ctrl = depressed & 4 != 0
+			},
+			repeat_info = proc "c" (data: rawptr, self: ^wl.wl_keyboard, rate, delay: i32) {
+				w := cast(^Window)data
+				w.repeat_every = rate > 0 ? time.Second / time.Duration(rate) : 0
+				w.repeat_delay = time.Duration(delay) * time.Millisecond
+			},
 		}
 		wl.wl_keyboard_add_listener(w.keyboard, &keyboard_listener, w)
 	}
@@ -351,7 +384,7 @@ on_key :: proc "c" (
 	data: rawptr,
 	self: ^wl.wl_keyboard,
 	serial: u32,
-	time: u32,
+	msec: u32,
 	key: u32,
 	state: u32,
 ) {
@@ -360,7 +393,40 @@ on_key :: proc "c" (
 	if state == wl.wl_keyboard_key_state_pressed {
 		// evdev keycodes are offset by 8 on the wire.
 		append(&w.input.keys_pressed, key)
+		w.held = key
+		w.next_repeat = time.time_add(time.now(), w.repeat_delay)
+	} else if key == w.held {
+		w.held = 0
 	}
+}
+
+// How long until a held key next repeats, for the frame loop's wait: -1 when
+// nothing is held.
+window_repeat_wait_ms :: proc(w: ^Window) -> i32 {
+	if w.held == 0 || w.repeat_every <= 0 do return -1
+	left := time.diff(time.now(), w.next_repeat)
+	return max(i32(time.duration_milliseconds(left)) + 1, 0)
+}
+
+// The character a key types, on a US layout, or 0 for a key that types
+// nothing. The font only has printable ASCII, so that is all this knows.
+window_key_char :: proc(key: u32, shift: bool) -> u8 {
+	@(static, rodata)
+	plain := [?]u8 {
+		0, 0, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 0, 0,
+		'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', 0, 0,
+		'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`', 0, '\\',
+		'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0, '*', 0, ' ',
+	}
+	@(static, rodata)
+	shifted := [?]u8 {
+		0, 0, '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', 0, 0,
+		'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', 0, 0,
+		'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~', 0, '|',
+		'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0, '*', 0, ' ',
+	}
+	if int(key) >= len(plain) do return 0
+	return shift ? shifted[key] : plain[key]
 }
 
 // Drains compositor events and clears the one-frame input. `timeout_ms` is how
@@ -372,6 +438,7 @@ window_poll :: proc(w: ^Window, timeout_ms: i32 = 0) {
 	w.input.released = {}
 	w.input.scroll = 0
 	clear(&w.input.keys_pressed)
+	clear(&w.input.keys_repeated)
 	w.resized = false
 
 	wl.display_flush(w.display)
@@ -388,6 +455,11 @@ window_poll :: proc(w: ^Window, timeout_ms: i32 = 0) {
 		}
 	}
 	wl.display_dispatch_pending(w.display)
+
+	if w.held != 0 && w.repeat_every > 0 && time.diff(w.next_repeat, time.now()) >= 0 {
+		append(&w.input.keys_repeated, w.held)
+		w.next_repeat = time.time_add(time.now(), w.repeat_every)
+	}
 }
 
 window_pixel_size :: proc(w: ^Window) -> (int, int) {
@@ -401,6 +473,7 @@ window_has_input :: proc(w: ^Window) -> bool {
 		w.input.released != {} ||
 		w.input.scroll != 0 ||
 		len(w.input.keys_pressed) > 0 ||
+		len(w.input.keys_repeated) > 0 ||
 		w.input.mouse != w.last_mouse \
 	)
 }
@@ -412,6 +485,7 @@ window_key_pressed :: proc(w: ^Window, key: u32) -> bool {
 
 window_close :: proc(w: ^Window) {
 	delete(w.input.keys_pressed)
+	delete(w.input.keys_repeated)
 	if w.blur_surface != nil do wl.ext_background_effect_surface_v1_destroy(w.blur_surface)
 	if w.decoration != nil do wl.zxdg_toplevel_decoration_v1_destroy(w.decoration)
 	if w.toplevel != nil do wl.xdg_toplevel_destroy(w.toplevel)
