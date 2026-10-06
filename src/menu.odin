@@ -209,7 +209,7 @@ draw_menu :: proc(app: ^App, full: Rect) {
 	card := Rect{x - 28, y - 28, w + 56, head + f32(max(shown, 1)) * MENU_ROW_H + foot + 44}
 	ui_rect(ui, {card.x + 3, card.y + 10, card.w, card.h}, rgba(0, 0, 0, u8(110 * t)), 20)
 	ui_rect(ui, rect_inset(card, -1, -1), rgba(255, 255, 255, u8(14 * t)), 19)
-	ui_rect(ui, card, rgba(20, 20, 20, u8(255 * t)), 18)
+	ui_rect(ui, card, rgba(17, 20, 22, u8(255 * t)), 18)
 
 	// A click outside the card is a click on the grid, and it shuts the menu
 	// rather than reaching the grid.
@@ -330,7 +330,7 @@ draw_row_art :: proc(app: ^App, r: Rect, row: Source, t: f32) {
 		want_art(app, row.art)
 		return
 	}
-	ui_image(ui, r, slot, radius, color_alpha(TEXT, t))
+	ui_image(ui, r, slot, radius, rgba(255, 255, 255, u8(255 * t)))
 }
 
 // A name as the font can draw it. The atlas is ASCII, so anything else comes
@@ -388,7 +388,7 @@ draw_chip :: proc(app: ^App, area: Rect) {
 	text = font_ellipsize(&ui.regular, text, size, area.w - 120)
 	tw := font_width(&ui.regular, text, size)
 	pill := Rect{area.x + (area.w - tw - 52) / 2, area.y + area.h - 60 + (1 - t) * 12, tw + 52, 38}
-	ui_rect(ui, pill, rgba(24, 24, 24, u8(235 * t)), 19)
+	ui_rect(ui, pill, rgba(28, 32, 35, u8(235 * t)), 19)
 	ui_circle(ui, {pill.x + 20, pill.y + 19}, 4, color_alpha(failed ? WARN : ACCENT, t))
 	ui_text(ui, &ui.regular, text, {pill.x + 34, pill.y + 9}, size, color_alpha(failed ? WARN : MUTED, t))
 }

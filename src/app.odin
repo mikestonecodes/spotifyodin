@@ -13,13 +13,20 @@ import stbi "vendor:stb/image"
 
 // Alpha here is the window's own transparency: the compositor blends whatever
 // is behind it through the background and the panels.
-BG :: Color(0xa6121212)
-PANEL :: Color(0xb4181818)
-PANEL_HI :: Color(0xff242424)
+//
+// The neutrals are alacritty's, the terminal that sits beside this window: its
+// background is #111416 at 0.85 opacity and its text #d8d8d8, so the base here
+// is that colour at that alpha and the two read as one surface over the
+// wallpaper. The panels step up from it with the same faint lean toward blue.
+// The bytes are RGBA8 little endian, so the hex reads 0xAABBGGRR: #111416 is
+// written 0x..161411, and reading it as RGB turns the lean warm.
+BG :: Color(0xd9161411)
+PANEL :: Color(0xb423201c)
+PANEL_HI :: Color(0xff2d2925)
 ACCENT :: Color(0xff54b91d) // Spotify green, RGBA8 little endian
-TEXT :: Color(0xffffffff)
-MUTED :: Color(0xffb3b3b3)
-DIM :: Color(0xff535353)
+TEXT :: Color(0xffd8d8d8)
+MUTED :: Color(0xffb6b3b0)
+DIM :: Color(0xff575450)
 WARN :: Color(0xff4d4dff) // something needs the user's attention
 
 // Ceiling on animation frames. Mailbox present does not block, so without a
@@ -785,7 +792,7 @@ draw_feature :: proc(app: ^App, r: Rect, name, artist: string, progress, duratio
 		artist_y := cover.y + cover.h - pad - 5 - 10 - artist_size * 1.2
 		title_y := artist_y - size * 1.08
 		ui_text(ui, &ui.bold, title, {cover.x + pad, title_y}, size, TEXT)
-		ui_text(ui, &ui.regular, who, {cover.x + pad, artist_y}, artist_size, rgba(255, 255, 255, 195))
+		ui_text(ui, &ui.regular, who, {cover.x + pad, artist_y}, artist_size, color_alpha(TEXT, 0.76))
 	}
 
 	// Progress belongs on the artwork: the control bar is hidden by default,
