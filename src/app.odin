@@ -15,12 +15,14 @@ import stbi "vendor:stb/image"
 // is behind it through the background and the panels.
 //
 // The neutrals are alacritty's, the terminal that sits beside this window: its
-// background is #111416 at 0.85 opacity and its text #d8d8d8, so the base here
-// is that colour at that alpha and the two read as one surface over the
-// wallpaper. The panels step up from it with the same faint lean toward blue.
-// The bytes are RGBA8 little endian, so the hex reads 0xAABBGGRR: #111416 is
-// written 0x..161411, and reading it as RGB turns the lean warm.
-BG :: Color(0xd9161411)
+// background is #111416 and its text #d8d8d8, so the base here is that colour
+// and the two read as one surface over the wallpaper. The panels step up from
+// it with the same faint lean toward blue. The bytes are RGBA8 little endian,
+// so the hex reads 0xAABBGGRR: #111416 is written 0x..161411, and reading it
+// as RGB turns the lean warm. The alpha is aithing's 0.3, not the
+// terminal's 0.85: the compositor blurs the desktop behind the window, and at
+// the terminal's alpha the frost barely came through.
+BG :: Color(0x4d161411)
 PANEL :: Color(0xb423201c)
 PANEL_HI :: Color(0xff2d2925)
 ACCENT :: Color(0xff54b91d) // Spotify green, RGBA8 little endian
@@ -999,7 +1001,8 @@ transport_button :: proc(ui: ^UI, label: string, r: Rect, icon: Icon, primary: b
 		ui_circle(ui, c, radius, rgba(255, 255, 255, u8(26 * hover)))
 	}
 
-	fg := primary ? BG : color_mix(MUTED, TEXT, hover)
+	// BG's own alpha is the window's frost; letters on the green want it solid.
+	fg := primary ? Color(0xff161411) : color_mix(MUTED, TEXT, hover)
 	draw_icon(ui, c, r.w * 0.3 * scale, icon, fg)
 	return clicked
 }
